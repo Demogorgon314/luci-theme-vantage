@@ -54,14 +54,18 @@ function fakeNet(dir, entries) {
 
 /* run cases through a plugin (the real one unless given its source),
    reading its bridges from a fake /sys/class/net with `entries` (default
-   3) records on br-lan: the harness's spawnSync result */
-function spawnUcode(cases, source, entries, rtnlFailure, sysfs) {
+   3) records on br-lan, plus optional board and legacy-library fixtures:
+   the harness's spawnSync result */
+function spawnUcode(cases, source, entries, options = {}) {
+	const { rtnlFailure, sysfs, board } = options;
 	const dir = mkTmp('vantage-plugin-');
 	const file = path.join(dir, 'cases.json');
 	const plugin = path.join(dir, 'luci.vantage');
 	const src = source == null ? fs.readFileSync(PLUGIN, 'utf8') : source;
 	const net = fakeNet(dir, entries == null ? 3 : entries);
 	const legacy = path.join(dir, 'libnl-tiny.so');
+	const boardFile = path.join(dir, 'board.json');
+	if (board != null) fs.writeFileSync(boardFile, typeof board === 'string' ? board : JSON.stringify(board));
 	if (sysfs) {
 		fs.writeFileSync(legacy, Buffer.from([ 0x7f, 69, 76, 70, 2, sysfs.endian || 1 ]));
 		for (const [ bridge, ports ] of Object.entries(sysfs.ports || {})) {
@@ -75,7 +79,8 @@ function spawnUcode(cases, source, entries, rtnlFailure, sysfs) {
 	}
 	fs.writeFileSync(file, JSON.stringify(cases));
 	fs.writeFileSync(plugin, src.replace(/^const NET = .*$/m, () => 'const NET = ' + JSON.stringify(net) + ';')
-		.replace(/^const LEGACY_LIBNL = .*$/m, () => 'const LEGACY_LIBNL = ' + JSON.stringify(legacy) + ';'));
+		.replace(/^const LEGACY_LIBNL = .*$/m, () => 'const LEGACY_LIBNL = ' + JSON.stringify(legacy) + ';')
+		.replace(/^const BOARD = .*$/m, () => 'const BOARD = ' + JSON.stringify(boardFile) + ';'));
 	const args = [ '-L', path.join(__dirname, 'ucode/stubs') ];
 	const lib = path.join(path.dirname(UCODE), '../lib/ucode');
 	if (fs.existsSync(lib)) args.push('-L', lib);
@@ -487,7 +492,7 @@ test('ucode plugin: crowded bridges are counted, not dumped', { skip: NO_UCODE }
 
 test('ucode plugin: a broken rtnl dependency leaves the other dashboard methods available', { skip: NO_UCODE }, () => {
 	const cases = [ BEHAVIOUR[24], BEHAVIOUR[0], { method: 'wired', fdb: 'no dump' }, { method: 'thermal' } ];
-	const r = spawnUcode(cases, null, 3, true);
+	const r = spawnUcode(cases, null, 3, { rtnlFailure: true });
 	assert.equal(r.status, 0, r.stderr);
 	const replies = JSON.parse(r.stdout);
 	assert.deepEqual(replies.slice(0, 2), runShim(cases.slice(0, 2)), 'wireless and validated alias writes still work');
@@ -509,7 +514,7 @@ function sysfsEntry(mac, port, age, local, endian = 1) {
 
 test('ucode plugin: legacy libnl uses bounded sysfs hosts without loading the native module', { skip: NO_UCODE }, () => {
 	const run = (entries, options) => {
-		const r = spawnUcode([ { method: 'wired', fdb: 'no dump' } ], null, entries, false, options);
+		const r = spawnUcode([ { method: 'wired', fdb: 'no dump' } ], null, entries, { sysfs: options });
 		assert.equal(r.status, 0, r.stderr);
 		return JSON.parse(r.stdout)[0].reply;
 	};
@@ -535,6 +540,107 @@ test('ucode plugin: legacy libnl uses bounded sysfs hosts without loading the na
 	assert.equal(run(sysfsEntry('00:00:5e:00:53:01', 1, 1234), { endian: 3, ports: { 'br-lan': ports } }).hosts[0].seen, null);
 	assert.deepEqual(run([ 3000, 1100 ], {}), { hosts: [], crowded: true });
 	assert.deepEqual(run(Buffer.alloc(0), {}), { hosts: [] });
+});
+
+/* a swconfig switch as OpenWrt's board.json describes it: LAN 1-4 on
+   ports 0-3, WAN on 4, the CPU on 5 as eth1; documentation values only */
+const SWITCH_BOARD = { model: { id: 'example,router', name: 'Example Router' }, switch: { switch0: { enable: true, reset: true,
+	ports: [ { num: 0, role: 'lan', index: 1 }, { num: 1, role: 'lan', index: 2 }, { num: 2, role: 'lan', index: 3 }, { num: 3, role: 'lan', index: 4 },
+		{ num: 4, role: 'wan' }, { num: 5, device: 'eth1', need_tag: false, want_untag: false } ],
+	roles: [ { role: 'lan', ports: '0 1 2 3 5t', device: 'eth1.1' }, { role: 'wan', ports: '4 5t', device: 'eth1.2' } ] } } };
+const SWITCH_UCI = [
+	{ '.name': 'cfg01', '.type': 'switch', name: 'switch0', reset: '1', enable_vlan: '1' },
+	{ '.name': 'cfg02', '.type': 'switch_vlan', device: 'switch0', vlan: '1', ports: '0 1 2 3 5t' },
+	{ '.name': 'cfg03', '.type': 'switch_vlan', device: 'switch0', vlan: '2', ports: '4 5t' },
+	{ '.name': 'wan', '.type': 'interface', device: 'eth1.2', proto: 'pppoe', username: 'user', password: 'not-for-the-dashboard' }
+];
+
+test('ucode plugin: a switch VLAN behind a port, from board.json and the switch_vlan sections only', { skip: NO_UCODE }, () => {
+	const src = fs.readFileSync(PLUGIN, 'utf8');
+	assert.match(src, /^const BOARD = '\/etc\/board\.json';$/m);
+	const run = (board, network, fdbIn) => {
+		const r = spawnUcode([ { method: 'wired', fdb: fdbIn || FDB, network_uci: network } ], null, 3, { board });
+		assert.equal(r.status, 0, r.stderr);
+		return JSON.parse(r.stdout)[0].reply;
+	};
+	const lan = n => ({ num: n, role: 'lan', index: n + 1 });
+	const r = run(SWITCH_BOARD, SWITCH_UCI);
+	assert.equal(r.hosts.length, 5, 'the hosts as before');
+	assert.deepEqual(r.switches, {
+		'eth1.1': { name: 'switch0', vlan: 1, ports: [ lan(0), lan(1), lan(2), lan(3) ] },
+		'eth1.2': { name: 'switch0', vlan: 2, ports: [ { num: 4, role: 'wan', index: null } ] }
+	});
+	assert.ok(!JSON.stringify(r).includes('not-for-the-dashboard'), 'nothing else of the network config');
+
+	/* no switch in board.json (DSA), no board.json, or one that does not
+	   parse: no switches, and the network config is never loaded */
+	const dsa = { model: { id: 'example,dsa' }, network: { lan: { ports: [ 'lan1', 'lan2' ] } } };
+	for (const b of [ dsa, null, '{"switch": {"switch0": ', '[]', JSON.stringify({ switch: { switch0: { ports: [ { num: 0, role: 'lan' } ] } } }) ])
+		assert.equal(run(b, 'no load').switches, undefined, 'board ' + JSON.stringify(b).slice(0, 40));
+	assert.deepEqual(run(SWITCH_BOARD, []).switches, r.switches, 'no switch_vlan sections: board.json\'s roles');
+
+	/* vid over vlan; an untagged CPU port is the bare device; bad tokens,
+	   unknown switches and bad device names skipped */
+	const odd = run(SWITCH_BOARD, [
+		{ '.name': 'a', '.type': 'switch_vlan', device: 'switch0', vlan: '3', vid: '100', ports: '0 1t 5t' },
+		{ '.name': 'b', '.type': 'switch_vlan', device: 'switch0', vlan: '4', ports: '2 x 99 7 3* 5' },
+		{ '.name': 'c', '.type': 'switch_vlan', device: 'switch1', vlan: '1', ports: '0 5t' },
+		{ '.name': 'd', '.type': 'switch_vlan', device: 'switch0', vlan: '1.5', ports: '0 5t' },
+		{ '.name': 'e', '.type': 'switch_vlan', device: 'switch0', vlan: '6', ports: '0 1' }
+	]);
+	assert.deepEqual(odd.switches, {
+		'eth1.100': { name: 'switch0', vlan: 100, ports: [ lan(0), lan(1) ] },
+		'eth1': { name: 'switch0', vlan: 4, ports: [ lan(2), { num: 7, role: null, index: null }, lan(3) ] }
+	});
+	/* GL.iNet's layout (#67): ports with a role and no number, a role
+	   longer than "wan", the CPU tagged; the switch_vlan sections named,
+	   or without their ports: board.json's roles */
+	const gl = { model: { id: 'example,gl' }, switch: { switch0: { enable: true, reset: 0,
+		ports: [ 0, 1, 2, 3 ].map(n => ({ num: n, role: 'lan' })).concat([ { num: 4, role: 'secondwan' }, { num: 5, device: 'eth1', need_tag: true, want_untag: false } ]),
+		roles: [ { role: 'lan', ports: '0 1 2 3 5t', device: 'eth1.1' }, { role: 'secondwan', ports: '4 5t', device: 'eth1.2' } ] } } };
+	const plain = n => ({ num: n, role: 'lan', index: null });
+	const glWant = { 'eth1.1': { name: 'switch0', vlan: 1, ports: [ plain(0), plain(1), plain(2), plain(3) ] }, 'eth1.2': { name: 'switch0', vlan: 2, ports: [ { num: 4, role: 'secondwan', index: null } ] } };
+	const named = [ { '.name': 'cfg01', '.type': 'switch', name: 'switch0', reset: '0', enable_vlan: '1' },
+		{ '.name': 'vlan_lan', '.type': 'switch_vlan', device: 'switch0', vlan: '1', ports: '0 1 2 3 5t' },
+		{ '.name': 'vlan_secondwan', '.type': 'switch_vlan', device: 'switch0', vlan: '2', ports: '4 5t' } ];
+	assert.deepEqual(run(gl, named).switches, glWant);
+	assert.deepEqual(run(gl, named.map(x => x['.type'] === 'switch_vlan' ? { '.name': x['.name'], '.type': x['.type'], device: x.device } : x)).switches, glWant, 'sections without ports: the roles');
+	/* the config wins where it has the switch's VLANs, roles or not */
+	assert.deepEqual(run(gl, [ { '.name': 'v', '.type': 'switch_vlan', device: 'switch0', vlan: '1', ports: '0 1 5t' } ]).switches,
+		{ 'eth1.1': { name: 'switch0', vlan: 1, ports: [ plain(0), plain(1) ] } });
+	/* roles that do not add up (a device that is not the CPU port's, no
+	   VLAN, no device name) are skipped */
+	const odd2 = JSON.parse(JSON.stringify(gl));
+	odd2.switch.switch0.roles = [ { role: 'lan', ports: '0 1 5t', device: 'eth2.1' }, { role: 'x', ports: '2 5', device: 'eth1' }, { role: 'y', ports: '3 5t', device: 'eth1.3;x' } ];
+	assert.equal(run(odd2, []).switches, undefined);
+	/* a VLAN on two CPU ports reaches this device on both */
+	const twoCpu = { switch: { switch0: { ports: [ { num: 0, role: 'lan', index: 1 }, { num: 5, device: 'eth0' }, { num: 6, device: 'eth1' } ] } } };
+	assert.deepEqual(run(twoCpu, [ { '.name': 'v', '.type': 'switch_vlan', device: 'switch0', vlan: '100', ports: '0 5t 6t' } ]).switches,
+		{ 'eth0.100': { name: 'switch0', vlan: 100, ports: [ lan(0) ] }, 'eth1.100': { name: 'switch0', vlan: 100, ports: [ lan(0) ] } });
+	/* only plain names, roles and numbers reach the reply */
+	const hostile = { switch: {
+		'switch0': { ports: [ { num: 0, role: 'lan<b>', index: 1 }, { num: 1, role: 'a'.repeat(17), index: 2 }, { num: 2, role: 'lan', index: 100 }, { num: 5, device: 'eth1' } ],
+			roles: [ { ports: '0 5t', device: 'eth1.4095' } ] },
+		'sw itch': { ports: [ { num: 0 }, { num: 5, device: 'eth2' } ], roles: [ { ports: '0 5t', device: 'eth2.1' } ] } } };
+	assert.deepEqual(run(hostile, [ { '.name': 'v', '.type': 'switch_vlan', device: 'switch0', vlan: '4095', ports: '0 5t' },
+		{ '.name': 'w', '.type': 'switch_vlan', device: 'switch0', vlan: '9', ports: '0 1 2 5t' } ]).switches,
+		{ 'eth1.9': { name: 'switch0', vlan: 9, ports: [ { num: 0, role: null, index: 1 }, { num: 1, role: null, index: 2 }, { num: 2, role: 'lan', index: null } ] } },
+		'no VLAN 4095, no odd role, index or switch name');
+	assert.equal(run(hostile, [ { '.name': 'v', '.type': 'switch_vlan', device: 'switch1', vlan: '1', ports: '0 5t' } ]).switches, undefined, 'roles with VLAN 4095: none');
+	const many = Array.from({ length: 70 }, (_, i) => ({ '.name': 'v' + i, '.type': 'switch_vlan', device: 'switch0', vlan: String(i + 1), ports: '0 5t' }));
+	assert.equal(Object.keys(run(SWITCH_BOARD, many).switches).length, 64, 'at most 64 VLANs');
+	const evil = JSON.parse(JSON.stringify(SWITCH_BOARD));
+	evil.switch.switch0.ports[5].device = 'eth1;reboot';
+	assert.equal(run(evil, 'no load').switches, undefined, 'a CPU device that is no device name: no switch');
+	const crowded = spawnUcode([ { method: 'wired', fdb: 'no dump', network_uci: SWITCH_UCI } ], null, 4096, { board: SWITCH_BOARD });
+	assert.equal(crowded.status, 0, crowded.stderr);
+	assert.deepEqual(Object.keys(JSON.parse(crowded.stdout)[0].reply), [ 'hosts', 'crowded', 'switches' ], 'crowded bridges: the switches still');
+	const legacy = spawnUcode([ { method: 'wired', fdb: 'no dump', network_uci: SWITCH_UCI } ], null,
+		sysfsEntry('00:00:5e:00:53:01', 1, 100), { board: SWITCH_BOARD, sysfs: { ports: { 'br-lan': { lan1: 1 } } } });
+	assert.equal(legacy.status, 0, legacy.stderr);
+	const combined = JSON.parse(legacy.stdout)[0].reply;
+	assert.equal(combined.hosts.length, 1, 'QWRT sysfs hosts remain available with upstream switch discovery');
+	assert.deepEqual(combined.switches, r.switches, 'switch discovery does not require the native netlink module');
 });
 
 test('stand-in: the replay falls back to the store\'s uci wireless when network.wireless is missing or empty', () => {

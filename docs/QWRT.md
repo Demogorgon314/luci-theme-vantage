@@ -12,7 +12,9 @@ Download packages from this fork's
 [Releases](https://github.com/Demogorgon314/luci-theme-vantage/releases).
 The first release is `v1.0.12-qwrt.1`, with package version `1.0.12-r2`,
 based on upstream v1.0.12. Upstream v1.0.13 has not been integrated into
-this tested baseline.
+this tested release baseline. The `qwrt` development branch now integrates
+upstream v1.0.13 as `1.0.13-r2`, with port traffic totals and swconfig switch
+details. That development code is not part of the `v1.0.12-qwrt.1` tag.
 
 Runtime checks covered a QWRT QSDK 12.5 ARM64 image with QCA wireless
 drivers, modern LuCI/ucode, and opkg. Its advertised firmware version does
@@ -59,7 +61,9 @@ longer needed. Then reload rpcd, log in again and force-refresh the page:
 Choose Vantage under System → System → Language and Style if it is not
 already selected. The dashboard's Storage section is inside the System
 tile. Its read ACL adds only `luci.getMountPoints`; no new write access is
-granted. Firmware updates may require reinstalling these packages.
+granted by that release. The later v1.0.13 integration also includes
+upstream's read-only `luci.getSwconfigPortState` grant. Firmware updates may
+require reinstalling these packages.
 
 ## Signed update feeds
 

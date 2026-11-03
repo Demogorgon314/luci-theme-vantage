@@ -70,7 +70,8 @@ without the app.
   link rate, Wi-Fi generation, live traffic and an experience score with
   its reason; filters by band, activity, weak signal and new clients.
   Wired devices too, from the bridge's table: port, link speed, traffic
-  when a device has its port to itself, and when each was last heard
+  when a device has its port to itself (else the port's total), the ports
+  of a swconfig switch behind a VLAN port, and when each was last heard
 - Client inspector: signal history, link rates, capabilities, traffic,
   retries; rename a device in place
 - Top talkers, wireless networks, system tile (CPU per core, memory,
@@ -207,8 +208,8 @@ node security-tests/test_acl_policy.js
 ## Security
 
 - **Read-only dashboard.** The app's rpcd ACL grants read methods only
-  (system, network, iwinfo, hostapd status, host hints, mDNS, `/proc/stat`)
-  and no `file.exec`. Wireless configuration comes from the app's own rpcd
+  (system, network, iwinfo, hostapd status, host hints, mDNS, `/proc/stat`,
+  and LuCI's swconfig switch port state) and no `file.exec`. Wireless configuration comes from the app's own rpcd
   ucode plugin (`luci.vantage wireless`), which leaves out Wi-Fi keys,
   SAE passwords and RADIUS secrets. Reverse DNS (`network.rrdns lookup`,
   which lets its holder aim the device's DNS queries at any server) is a

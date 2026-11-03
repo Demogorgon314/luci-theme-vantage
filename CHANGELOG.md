@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased - upstream 1.0.13 integration
+
+Development packages use `1.0.13-r2`. The published `v1.0.12-qwrt.1` tag
+continues to identify the original tested release.
+
+- Merge upstream v1.0.13 (`2bfecc1`): port traffic totals and swconfig
+  switch-port details behind VLANs, including the upstream read-only
+  `luci.getSwconfigPortState` grant.
+- Preserve the QWRT runtime wireless mapping, native-library crash guard,
+  bounded sysfs forwarding reader and mount-point storage fallback.
+- Combine upstream network-config and board-description security checks
+  with QWRT's runtime-state and legacy-library checks. Both sets of
+  regression cases run together.
+
 ## 1.0.12-qwrt.1 - 2026-11-03
 
 First maintained QWRT release, based on upstream v1.0.12. Both packages and
@@ -28,6 +42,24 @@ Each release ships both packages, `luci-theme-vantage` and
 `luci-app-vantage`, at the same version; the packages are listed at
 <https://github.com/anothaDev/luci-theme-vantage/releases> and in the
 [signed repositories](https://anothadev.github.io/luci-theme-vantage/).
+
+## 1.0.13 - 2026-11-02
+
+- **Dashboard: a port's traffic on its node** (#67,
+  [@bakaranadnan-a11y](https://github.com/bakaranadnan-a11y)). Each port
+  node in the network path's Wired branch shows the port's live traffic,
+  and a device on a shared port (a switch or another access point behind
+  it) shows the port's total in its details, under "Not counted per
+  device". It stays the port's: no device gets a share of it.
+- **Dashboard: the switch ports behind a swconfig VLAN** (#67). Where a
+  port is a VLAN on a swconfig switch (`eth1.1` on routers with a
+  hardware switch), a device's details list the VLAN's switch ports and
+  their links, from LuCI's own switch port state, asked at most every
+  30 seconds. Ports are named as swconfig numbers them ("Port 1") unless
+  the board description numbers them per role ("LAN 2"). When only one of them has a link, the devices behind it get
+  that port's speed instead of the switch's link to the CPU. Which port
+  each device is on stays unknown otherwise. The app's read permission
+  gains `luci getSwconfigPortState`.
 
 ## 1.0.12 - 2026-11-01
 
