@@ -118,6 +118,26 @@ return baseclass.extend({
 		return { label: label, total: total, used: used, free: free, usedPct: used / total * 100 };
 	},
 
+	/* getMountPoints uses bytes; older system.info root/tmp use KiB.
+	   Prefer the writable overlay over the duplicate / and read-only /rom. */
+	storage: function(info, mounts) {
+		var self = this;
+		info = obj(info);
+		mounts = arr(mounts);
+		function at(path, label) {
+			for (var i = 0; i < mounts.length; i++) {
+				var s = obj(mounts[i]);
+				if (s.mount !== path || !finite(s.size) || !(s.size > 0) || !finite(s.free) || s.free < 0 || s.free > s.size) continue;
+				return self.mount({ total: s.size / 1024, used: (s.size - s.free) / 1024,
+					avail: finite(s.avail) && s.avail >= 0 ? s.avail / 1024 : undefined }, label);
+			}
+			return null;
+		}
+		var root = _('Root (overlay)'), tmp = _('Temporary (RAM)');
+		return [ at('/overlay', root) || at('/', root) || this.mount(info.root, root),
+			at('/tmp', tmp) || this.mount(info.tmp, tmp) ].filter(Boolean);
+	},
+
 	/* ---------------------------------------------------------- counters */
 
 	/* Rate between two byte-counter samples { at: ms, rx, tx }.
@@ -632,7 +652,7 @@ return baseclass.extend({
 				load: arr(info.load).slice(0, 3).map(num),
 				memory: mem,
 				swap: this.swap(info.swap),
-				storage: [ this.mount(info.root, _('Root (overlay)')), this.mount(info.tmp, _('Temporary (RAM)')) ].filter(Boolean)
+				storage: this.storage(info, raw.mounts)
 			},
 			uplink: uplink,
 			networks: this.networks(raw.ifaces, uplink),

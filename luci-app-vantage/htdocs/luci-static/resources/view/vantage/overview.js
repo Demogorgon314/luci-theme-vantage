@@ -30,6 +30,7 @@ var HOSTAPD_OBJ = /^[A-Za-z0-9_.-]{1,64}$/;
 
 var callBoard = rpc.declare({ object: 'system', method: 'board' });
 var callInfo = rpc.declare({ object: 'system', method: 'info' });
+var callMounts = rpc.declare({ object: 'luci', method: 'getMountPoints', expect: { result: [] } });
 var callRead = rpc.declare({ object: 'file', method: 'read', params: [ 'path' ], expect: { data: '' } });
 var callIfDump = rpc.declare({ object: 'network.interface', method: 'dump', expect: { 'interface': [] } });
 var callDevs = rpc.declare({ object: 'network.device', method: 'status', expect: { '': {} } });
@@ -506,7 +507,8 @@ return view.extend({
 			L.resolveDefault(callWifi(), null),
 			L.resolveDefault(callHints(), {}),
 			L.resolveDefault(callThermal(), []),
-			L.resolveDefault(callWired(), {})
+			L.resolveDefault(callWired(), {}),
+			L.resolveDefault(callMounts(), [])
 		]).then(function(r) {
 			var wifiDevs = (r[4] && typeof r[4] === 'object') ? r[4] : null;
 			var wiredReply = (r[7] && typeof r[7] === 'object') ? r[7] : {};
@@ -535,7 +537,7 @@ return view.extend({
 					else if (p[0] === 'hapdStatus') hapdStatus[p[1]] = p[2];
 					else iwinfo[p[1]] = p[2];
 				});
-				return { info: r[0] || {}, stat: r[1] || '', ifaces: r[2] || [], devs: r[3] || {}, wifi: wifiDevs, hints: r[5] || {}, thermal: r[6] || [],
+				return { info: r[0] || {}, mounts: r[8] || [], stat: r[1] || '', ifaces: r[2] || [], devs: r[3] || {}, wifi: wifiDevs, hints: r[5] || {}, thermal: r[6] || [],
 					fdb: Array.isArray(wiredReply.hosts) ? wiredReply.hosts : [], fdbCrowded: wiredReply.crowded === true,
 					assoc: assoc, hapd: hapd, hapdStatus: hapdStatus, iwinfo: iwinfo, at: Date.now(), started: started };
 			});
@@ -609,7 +611,7 @@ return view.extend({
 		st.temps = model.temps(raw.thermal);
 
 		var m = model.build({
-			board: this.board, info: raw.info, ifaces: raw.ifaces, devs: raw.devs, wifi: raw.wifi, iwinfo: raw.iwinfo,
+			board: this.board, info: raw.info, mounts: raw.mounts, ifaces: raw.ifaces, devs: raw.devs, wifi: raw.wifi, iwinfo: raw.iwinfo,
 			assoc: raw.assoc, hapd: raw.hapd, hapdStatus: raw.hapdStatus, hints: raw.hints, fdb: raw.fdb,
 			aliases: this.aliases, rdns: st.rdns, mdns: st.mdns,
 			vendor: st.oui ? function(k) { return k ? st.oui.lookup(k) : null; } : null
@@ -764,7 +766,7 @@ return view.extend({
 		if (!this.lastRaw) return;
 		var st = this.st, raw = this.lastRaw;
 		var m = model.build({
-			board: this.board, info: raw.info, ifaces: raw.ifaces, devs: raw.devs, wifi: raw.wifi, iwinfo: raw.iwinfo,
+			board: this.board, info: raw.info, mounts: raw.mounts, ifaces: raw.ifaces, devs: raw.devs, wifi: raw.wifi, iwinfo: raw.iwinfo,
 			assoc: raw.assoc, hapd: raw.hapd, hapdStatus: raw.hapdStatus, hints: raw.hints, fdb: raw.fdb,
 			aliases: this.aliases, rdns: st.rdns, mdns: st.mdns,
 			vendor: st.oui ? function(k) { return k ? st.oui.lookup(k) : null; } : null
@@ -1929,7 +1931,7 @@ return view.extend({
 				E('div', { 'class': 'vt-mount-top' }, [ E('span', {}, [ s.label ]), E('span', { 'class': 'vt-tn vt-hint' }, [ _('%s used of %s').format(fmt.bytes(s.used), fmt.bytes(s.total)) ]) ]),
 				E('div', { 'class': 'vt-bar' }, [ f ])
 			]);
-		}));
+		}).concat(d.storage.length ? [] : [ E('span', { 'class': 'vt-muted' }, [ _('Not reported') ]) ]));
 		patch(el.fw, [
 			E('span', {}, [ d.firmware || '' ]),
 			d.kernel ? E('span', { 'class': 'vt-hint' }, [ _('Kernel %s').format(d.kernel) ]) : ''

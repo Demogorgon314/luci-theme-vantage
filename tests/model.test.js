@@ -69,6 +69,39 @@ test('swap only when configured; mounts in bytes', () => {
 	assert.equal(model.mount({}, 'x'), null);
 });
 
+test('build: storage works without system.info root/tmp, preferring overlay and keeping byte units', () => {
+	const storage = model.build({ info: {}, mounts: [
+		{ mount: '/rom', size: 100000, free: 0, avail: 0 },
+		{ mount: '/', size: 80000, free: 10000, avail: 9000 },
+		{ mount: '/tmp', size: 200000, free: 180000, avail: 180000 },
+		{ mount: '/overlay', size: 100000, free: 40000, avail: 35000 }
+	] }).device.storage;
+	assert.deepEqual(storage, [
+		{ label: 'Root (overlay)', total: 100000, used: 60000, free: 35000, usedPct: 60 },
+		{ label: 'Temporary (RAM)', total: 200000, used: 20000, free: 180000, usedPct: 10 }
+	]);
+});
+
+test('build: root-only mounts and partial replies retain legacy storage independently', () => {
+	const info = { root: { total: 100, used: 20 }, tmp: { total: 200, used: 30 } };
+	const legacy = model.build({ info }).device.storage;
+	assert.equal(legacy.length, 2);
+	assert.equal(legacy[0].total, 102400);
+	const partial = model.build({ info, mounts: [ { mount: '/', size: 90000, free: 30000 } ] }).device.storage;
+	assert.equal(partial[0].used, 60000);
+	assert.equal(partial[0].free, 30000);
+	assert.deepEqual(partial[1], legacy[1]);
+	assert.deepEqual(model.build({ info, mounts: {} }).device.storage, legacy);
+});
+
+test('build: unavailable or invalid mount statistics do not invent storage or select the ROM', () => {
+	const mounts = [ null, { mount: '/rom', size: 100000, free: 0 },
+		{ mount: '/overlay', size: 0, free: 0 }, { mount: '/tmp', size: 1000, free: -1 },
+		{ mount: '/', size: 1000, free: 2000 }, { mount: '/overlay', size: '1000', free: 100 } ];
+	assert.deepEqual(model.build({ mounts }).device.storage, []);
+	assert.deepEqual(model.build({}).device.storage, []);
+});
+
 test('counterRate: states and bit/s', () => {
 	assert.equal(model.counterRate(null, { at: 1, rx: 0, tx: 0 }).state, 'first');
 	assert.equal(model.counterRate({ at: 1000, rx: 0, tx: 0 }, { at: 1500, rx: 10, tx: 10 }).state, 'skip');

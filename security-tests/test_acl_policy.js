@@ -79,6 +79,7 @@ const FIREWALL_VIEW = 'view/vantage/firewall.js';
 const READ_UBUS = {
 	'file': [ 'read' ],
 	'system': [ 'board', 'info' ],
+	'luci': [ 'getMountPoints' ],
 	'network.interface': [ 'dump' ],
 	'network.device': [ 'status' ],
 	'luci-rpc': [ 'getHostHints' ],

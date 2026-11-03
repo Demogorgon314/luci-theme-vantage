@@ -831,6 +831,20 @@ including CPU reads and host hints after wired discovery, while checking
 that the same login session and rpcd process survive. Single method calls
 do not cover this interaction.
 
+### Storage is missing from the System tile
+
+The dashboard reads `luci.getMountPoints` for the writable root filesystem
+(`/overlay`, or `/` when no overlay is mounted) and temporary RAM storage
+(`/tmp`). It avoids counting the duplicate root mount or the read-only ROM.
+Older `system.info` root/tmp statistics remain a fallback; some QWRT builds
+omit these fields entirely. Mount-point sizes are bytes, while the legacy
+fields use KiB. If neither source reports capacity, the tile says
+"Not reported" instead of displaying an empty storage area.
+
+The app's read group grants only `luci.getMountPoints` on the `luci` object.
+After updating the ACL file, reload rpcd and log in again to refresh the
+session's permissions.
+
 ### Realtime Graphs are empty
 
 Status → Realtime Graphs is a stock LuCI page. It gets its data from the

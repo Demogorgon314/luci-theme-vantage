@@ -8,6 +8,7 @@
 			"ubus": {
 				"file": [ "read" ],
 				"system": [ "board", "info" ],
+				"luci": [ "getMountPoints" ],
 				"network.interface": [ "dump" ],
 				"network.device": [ "status" ],
 				"luci-rpc": [ "getHostHints" ],

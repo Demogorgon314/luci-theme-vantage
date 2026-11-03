@@ -29,6 +29,31 @@ function loadView() {
 
 const view = loadView();
 
+test('storage: polling and a later name refresh keep mount capacities without legacy info fields', async () => {
+	const saved = { L: global.L, window: global.window };
+	global.L = { resolveDefault: (promise, fallback) => Promise.resolve(promise).catch(() => fallback) };
+	global.window = { sessionStorage: { getItem: () => null, setItem() {} }, localStorage: { getItem: () => null } };
+	const mounts = [ { mount: '/overlay', size: 100000, free: 40000, avail: 35000 }, { mount: '/tmp', size: 200000, free: 180000 } ];
+	REPLIES['luci getMountPoints'] = () => Promise.resolve(mounts);
+	try {
+		const self = Object.create(view);
+		self.initState({ board: {}, canWrite: false, canRdns: false, mdns: null });
+		self.resolveMore = () => {};
+		self.paint = () => {};
+		const raw = await self.fetch();
+		self.ingest(raw);
+		assert.deepEqual(self.m.device.storage.map(s => [ s.total, s.used ]), [ [ 100000, 60000 ], [ 200000, 20000 ] ]);
+		self.rerender();
+		assert.equal(self.m.device.storage.length, 2, 'renaming a client must not discard the storage data');
+		REPLIES['luci getMountPoints'] = () => Promise.reject(new Error('Method unavailable'));
+		assert.deepEqual((await self.fetch()).mounts, [], 'an unavailable optional method does not fail the whole poll');
+	} finally {
+		delete REPLIES['luci getMountPoints'];
+		global.L = saved.L;
+		global.window = saved.window;
+	}
+});
+
 function withLocation(hash, fn) {
 	const cleared = [];
 	const saved = { location: global.location, history: global.history };
