@@ -21,6 +21,7 @@ vantage-build.*/
 *.pem
 # the project's PUBLIC signing key is published on purpose
 !/keys/vantage-signing.pem
+!/keys/qwrt-signing.pem
 key-build*
 private-key*
 *.key

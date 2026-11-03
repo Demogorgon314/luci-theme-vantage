@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vantage QWRT packages</title>
+<style>
+body { font: 16px/1.6 system-ui, sans-serif; max-width: 48rem; margin: 3rem auto; padding: 0 1rem; color: #e8eaed; background: #0d0e10; }
+a { color: #c8f031; } pre { background: #15171a; padding: 1rem; overflow-x: auto; }
+</style>
+</head>
+<body>
+<h1>Vantage QWRT packages</h1>
+<p>Theme, dashboard and translations maintained in
+<a href="https://github.com/Demogorgon314/luci-theme-vantage">Demogorgon314/luci-theme-vantage</a>.</p>
+<p>Use the format supported by your firmware's package manager: IPK for opkg,
+APK for apk. A vendor firmware's version label does not establish its format.</p>
+<h2>opkg feed</h2>
+<pre>wget -O /tmp/qwrt-24.10.usign.pub https://Demogorgon314.github.io/luci-theme-vantage/qwrt-24.10.usign.pub
+usign -F -p /tmp/qwrt-24.10.usign.pub
+# must print 36f38cc55cf41341
+opkg-key add /tmp/qwrt-24.10.usign.pub
+echo 'src/gz vantage_qwrt https://Demogorgon314.github.io/luci-theme-vantage/24.10' &gt;&gt; /etc/opkg/customfeeds.conf
+opkg update
+opkg install luci-theme-vantage luci-app-vantage luci-i18n-vantage-theme-zh-cn luci-i18n-vantage-zh-cn</pre>
+<h2>apk feed</h2>
+<p>The public key is <a href="qwrt-signing.pem">qwrt-signing.pem</a>, SHA-256
+<code>3dbdd86c2b8f6e343d5fa947affc5bb229fb82e1f1c949c5f28b2614355df54d</code>.
+The signed index is <a href="25.12/packages.adb">25.12/packages.adb</a>.</p>
+<p>Use this feed instead of the upstream Vantage feed for these package names.
+Keep the normal dependency feeds supplied by your firmware.</p>
+<p><a href="https://github.com/Demogorgon314/luci-theme-vantage/releases">Release downloads</a> ·
+<a href="https://github.com/Demogorgon314/luci-theme-vantage/blob/qwrt/docs/QWRT.md">Install and maintenance guide</a> ·
+<a href="https://github.com/anothaDev/luci-theme-vantage">Upstream project</a></p>
+</body>
+</html>

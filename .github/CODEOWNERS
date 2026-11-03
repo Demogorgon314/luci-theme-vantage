@@ -1,8 +1,8 @@
 # Changes to these paths always request the maintainer's review.
-/.github/                                  @anothaDev
-/security-tests/                           @anothaDev
-/keys/                                     @anothaDev
-/dev/build/                                @anothaDev
-/.release-manifests/                       @anothaDev
-/luci-app-vantage/root/usr/share/rpcd/     @anothaDev
-/luci-theme-vantage/ucode/                 @anothaDev
+/.github/                                  @Demogorgon314
+/security-tests/                           @Demogorgon314
+/keys/                                     @Demogorgon314
+/dev/build/                                @Demogorgon314
+/.release-manifests/                       @Demogorgon314
+/luci-app-vantage/root/usr/share/rpcd/     @Demogorgon314
+/luci-theme-vantage/ucode/                 @Demogorgon314

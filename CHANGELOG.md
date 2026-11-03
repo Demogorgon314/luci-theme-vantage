@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.0.12-qwrt.1 - 2026-11-03
+
+First maintained QWRT release, based on upstream v1.0.12. Both packages and
+their translations use package version `1.0.12-r2`. Upstream v1.0.13 is not
+part of this tested baseline. Downloads and update instructions are in the
+[QWRT guide](docs/QWRT.md).
+
+- Read QCA wireless interface names from runtime state when netifd does
+  not expose radio status, retaining persistent SSIDs and security settings.
+- Recognize QSDK's split Wi-Fi 7 generation and channel-width settings.
+- Discover bridge-learned hosts through bounded sysfs records on firmware
+  with legacy libnl. Avoid loading the conflicting native module that
+  crashed rpcd and invalidated dashboard login sessions. No companion
+  library package is needed; VLAN identifiers are unknown on this path.
+- Restore system and temporary storage meters with `luci.getMountPoints`;
+  the dashboard gains only that read permission, with no new write grants.
+- Build IPK and APK packages in CI and publish this fork's signed indexes
+  with separate keys. Preserve the upstream keys for reference.
+
+Validated on a QWRT QSDK 12.5 ARM64 image with QCA wireless drivers. Other
+vendor images require their own runtime verification. All upstream release
+notes below describe the original upstream distributions.
+
 User-visible changes per release, newest first. Dates are the tag dates.
 Each release ships both packages, `luci-theme-vantage` and
 `luci-app-vantage`, at the same version; the packages are listed at

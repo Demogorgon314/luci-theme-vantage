@@ -1,3 +1,9 @@
+> **QWRT maintained fork:** Releases and QWRT compatibility fixes are maintained
+> in [Demogorgon314/luci-theme-vantage](https://github.com/Demogorgon314/luci-theme-vantage).
+> Use the [QWRT install and maintenance guide](docs/QWRT.md) for this fork's
+> packages, signing keys and update process. The upstream project is
+> [anothaDev/luci-theme-vantage](https://github.com/anothaDev/luci-theme-vantage).
+
 <div align="center">
 
 <img src="luci-theme-vantage/htdocs/luci-static/vantage/logo.svg" width="88" height="88" alt="Vantage logo">

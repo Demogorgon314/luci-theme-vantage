@@ -11,7 +11,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-vantage
 PKG_VERSION:=1.0.12
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_LICENSE:=GPL-3.0-or-later
 
 LUCI_TITLE:=Vantage dashboard
@@ -29,7 +29,7 @@ LUCI_DESCRIPTION:=Live network dashboard (landing page under admin/dashboard): d
 LUCI_DEPENDS:=+luci-base +rpcd +rpcd-mod-iwinfo +rpcd-mod-ucode +ucode-mod-uci +ucode-mod-ubus +ucode-mod-fs +ucode-mod-rtnl
 LUCI_PKGARCH:=all
 LUCI_MAINTAINER:=anothaDev <10740588+anothaDev@users.noreply.github.com>
-LUCI_URL:=https://github.com/anothaDev/luci-theme-vantage
+LUCI_URL:=https://github.com/Demogorgon314/luci-theme-vantage
 
 # app.css uses custom properties, color-mix() and container queries,
 # which csstidy (a CSS2-era minifier) mangles; ship it byte for byte.

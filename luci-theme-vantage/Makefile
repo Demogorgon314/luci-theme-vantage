@@ -11,7 +11,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-theme-vantage
 PKG_VERSION:=1.0.12
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_LICENSE:=GPL-3.0-or-later
 
 LUCI_TITLE:=Vantage theme
@@ -19,7 +19,7 @@ LUCI_DESCRIPTION:=A console-style LuCI theme: icon rail with flyouts, \
 	breadcrumb, page tabs, Ctrl+K command palette, light and dark modes.
 LUCI_DEPENDS:=+luci-base
 LUCI_MAINTAINER:=anothaDev <10740588+anothaDev@users.noreply.github.com>
-LUCI_URL:=https://github.com/anothaDev/luci-theme-vantage
+LUCI_URL:=https://github.com/Demogorgon314/luci-theme-vantage
 
 # The stylesheet uses modern CSS (custom properties, :is(), :has(),
 # :where(), color-mix(), inset) that csstidy mangles, so it ships as

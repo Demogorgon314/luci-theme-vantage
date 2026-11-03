@@ -1,5 +1,9 @@
 # Installing Vantage
 
+**Using the QWRT fork?** Follow [QWRT installation and maintenance](QWRT.md)
+for this fork's release packages and signing keys. The upstream repository
+instructions below do not distribute this fork's QWRT patches.
+
 This guide covers installing the Vantage theme (`luci-theme-vantage`) and
 dashboard (`luci-app-vantage`) on a router running OpenWrt, building them
 into your own firmware, and undoing all of it again.

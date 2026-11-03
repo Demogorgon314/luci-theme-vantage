@@ -17,8 +17,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
-    tags: ['v*']
+    branches: [main, qwrt]
+    tags: ['v*-qwrt.*']
   pull_request:
   workflow_dispatch:
 
@@ -31,7 +31,7 @@ concurrency:
 
 env:
   # ucode as pinned by OpenWrt 25.12 (package/utils/ucode PKG_SOURCE_VERSION)
-  UCODE_REPO: https://github.com/jow-/ucode.git
+  UCODE_REPO: https://github.com/ucode-lang/ucode.git
   UCODE_REV: 85922056ef7abeace3cca3ab28bc1ac2d88e31b1
   # the SDK releases built (keep in step with the build matrix below)
   SDK_APK: 25.12.4
@@ -147,11 +147,11 @@ jobs:
           # the secret must match the public key users are told to trust
           out="dist/$SDK_RELEASE" ok=
           if [ "$FMT" = apk ]; then
-            pub=keys/vantage-signing.pem
+            pub=keys/qwrt-signing.pem
             want=$(sha256sum < "$pub" | cut -d' ' -f1)
             grep -qx "signing_public_key_sha256=$want" "$out/BUILDINFO" && ok=1
           else
-            pub=keys/vantage-24.10.usign.pub usign="dist/.tools/$SDK_RELEASE/usign"
+            pub=keys/qwrt-24.10.usign.pub usign="dist/.tools/$SDK_RELEASE/usign"
             want=$("$usign" -F -p "$pub")
             grep -qx "signing_key_fingerprint=$want" "$out/BUILDINFO" &&
               "$usign" -V -m "$out/Packages" -p "$pub" && ok=1
@@ -262,8 +262,8 @@ jobs:
           mkdir -p "site/${SDK_APK%.*}" "site/${SDK_IPK%.*}"
           cp "$a"/*.apk "$a"/packages.adb "$a"/SHA256SUMS "site/${SDK_APK%.*}/"
           cp "$i"/*.ipk "$i"/Packages "$i"/Packages.gz "$i"/Packages.sig "$i"/SHA256SUMS "site/${SDK_IPK%.*}/"
-          cp keys/vantage-signing.pem keys/vantage-24.10.usign.pub site/
-          cp dev/build/repo-index.html site/index.html
+          cp keys/qwrt-signing.pem keys/qwrt-24.10.usign.pub site/
+          cp dev/build/qwrt-repo-index.html site/index.html
           find site -type f | sort
 
       - name: Upload site
