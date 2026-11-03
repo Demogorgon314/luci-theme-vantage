@@ -14,6 +14,7 @@ blocked.log
 
 # local SDK build output (packages, SHA256SUMS, BUILDINFO, dist/.tools/)
 /dist/
+__pycache__/
 # a build work directory, if TMPDIR points into the tree
 vantage-build.*/
 

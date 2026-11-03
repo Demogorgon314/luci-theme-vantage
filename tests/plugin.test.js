@@ -55,7 +55,7 @@ function fakeNet(dir, entries) {
 /* run cases through a plugin (the real one unless given its source),
    reading its bridges from a fake /sys/class/net with `entries` (default
    3) records on br-lan: the harness's spawnSync result */
-function spawnUcode(cases, source, entries) {
+function spawnUcode(cases, source, entries, rtnlFailure) {
 	const dir = mkTmp('vantage-plugin-');
 	const file = path.join(dir, 'cases.json');
 	const plugin = path.join(dir, 'luci.vantage');
@@ -66,6 +66,7 @@ function spawnUcode(cases, source, entries) {
 		const args = [ '-L', path.join(__dirname, 'ucode/stubs') ];
 		const lib = path.join(path.dirname(UCODE), '../lib/ucode');
 		if (fs.existsSync(lib)) args.push('-L', lib);
+		if (rtnlFailure) args.push('-D', 'RTNL_FAILURE=true');
 		args.push('-D', 'PLUGIN=' + plugin, '-D', 'CASES=' + file, path.join(__dirname, 'ucode/harness.uc'));
 		return spawnSync(UCODE, args, { encoding: 'utf8' });
 	} finally {
@@ -99,7 +100,7 @@ function runShim(cases) {
 		if (!Object.prototype.hasOwnProperty.call(shim.POLICY, c.method)) return { status: 3, reply: null, sections: orig, reverted };
 		if (!shim.argsOk(c.method, c.args)) return { status: 2, reply: null, sections: orig, reverted };
 		const reply = c.method === 'wireless'
-			? shim.wirelessReply((c.ubus || {})['network.wireless status'] ?? null, c.wireless_uci ?? null)
+			? shim.wirelessReply((c.ubus || {})['network.wireless status'] ?? null, c.wireless_uci ?? null, c.wireless_state ?? null)
 			: c.method === 'wired' ? { hosts: shim.wired(c.fdb ?? null) }
 			: shim.setAlias(cursor, c.args || {});
 		return { status: 0, reply, sections: committed ? sections : orig, reverted };
@@ -202,6 +203,31 @@ const BOOLS = [
 	dev('r_no', '2g', '6', 'EHT20', { disabled: 'false' })
 ];
 
+const QCA = [
+	dev('qca0', '5g', '36', 'HT160', { type: 'qcawificfg80211', hwmode: '11bea' }),
+	wif('qca_ap', 'qca0', null, { ssid: 'Configured network', encryption: 'sae' }),
+	wif('qca_fixed', 'qca0', 'ath9'),
+	wif('qca_off', 'qca0', null, { disabled: '1' }),
+	dev('qca1', '2g', '6', 'HT20', { type: 'qcawifi', hwmode: '11beg' }),
+	wif('qca_wrong', 'qca1', null),
+	wif('qca_bad', 'qca1', null),
+	dev('standard', '5g', '36', 'HE80', { type: 'mac80211' }),
+	wif('standard_ap', 'standard', null)
+];
+const QCA_STATE = [
+	wif('qca_ap', 'qca0', 'ath0', Object.assign({ ssid: 'Stale network', encryption: 'none' }, SECRETS)),
+	wif('qca_fixed', 'qca0', 'ath8'),
+	wif('qca_off', 'qca0', 'ath1'),
+	wif('qca_wrong', 'qca0', 'ath2'),
+	wif('qca_bad', 'qca1', 'ath3; reboot'),
+	wif('standard_ap', 'standard', 'wlan0')
+];
+const QCA_CASES = [
+	{ method: 'wireless', ubus: {}, wireless_uci: QCA, wireless_state: QCA_STATE },
+	{ method: 'wireless', ubus: {}, wireless_uci: QCA },
+	{ method: 'wireless', ubus: { 'network.wireless status': WIRELESS }, wireless_uci: QCA, wireless_state: QCA_STATE }
+];
+
 /* the bridge forwarding database as ucode's rtnl dumps it (RTM_GETNEIGH,
    AF_BRIDGE): learned hosts are kept, everything else is left out */
 const fdb = (lladdr, dev, extra) => Object.assign({ family: 7, dev, master: 'br-lan', lladdr, state: 0x02, flags: 0,
@@ -275,7 +301,7 @@ const BEHAVIOUR = [
 
 const NAME_CASES = NAMES.map(([ n ]) => ({ method: 'set_alias', args: { mac: MAC, name: n } }));
 const MAC_CASES = MACS.map(m => ({ method: 'set_alias', args: { mac: m, name: 'x' } }));
-const ALL = BEHAVIOUR.concat(NAME_CASES, MAC_CASES);
+const ALL = BEHAVIOUR.concat(QCA_CASES, NAME_CASES, MAC_CASES);
 
 /* -------------------------------------------------------------- tests */
 
@@ -388,6 +414,31 @@ test('stand-in: disabled reads like config_get_bool, and a disabled section clai
 	assert.deepEqual(m.radios.map(x => [ x.id, x.disabled ]), [ [ 'r_no', false ], [ 'r_on', false ], [ 'r_true', true ], [ 'r_yes', true ] ]);
 });
 
+test('wireless: QSDK interface names come from runtime state without replacing configured settings', () => {
+	const [ runtime, absent, netifd ] = runShim(QCA_CASES);
+	assert.deepEqual(runtime.reply.qca0.interfaces.map(i => i.ifname), [ 'ath0', 'ath9' ]);
+	assert.equal(runtime.reply.qca0.interfaces[0].config.ssid, 'Configured network');
+	assert.equal(runtime.reply.qca0.interfaces[0].config.encryption, 'sae');
+	assert.equal(runtime.reply.qca0.config.htmode, 'EHT160');
+	assert.equal(runtime.reply.qca1.config.htmode, 'EHT20');
+	assert.deepEqual(runtime.reply.qca1.interfaces, [], 'wrong radio and unsafe names are refused');
+	assert.deepEqual(runtime.reply.standard.interfaces, [], 'runtime fallback is limited to QCA drivers');
+	assert.deepEqual(absent.reply.qca0.interfaces.map(i => i.ifname), [ 'ath9' ]);
+	assert.deepEqual(netifd.reply, shim.reduceWireless(WIRELESS), 'netifd remains authoritative');
+	const text = JSON.stringify(runtime.reply);
+	for (const secret of Object.values(SECRETS).flat()) assert.ok(!text.includes(secret), 'runtime secrets never leave the plugin');
+});
+
+test('model: QSDK Wi-Fi 7 uses the configured generation and measured running state', () => {
+	const model = load('vantage.model');
+	const wifi = runShim(QCA_CASES)[0].reply;
+	const m = model.build({ wifi, iwinfo: { ath0: { channel: 36, frequency: 5180, htmode: 'HE160' } } });
+	const radio = m.radios.find(r => r.id === 'qca0');
+	assert.equal(radio.up, true);
+	assert.equal(radio.gen, 'Wi-Fi 7');
+	assert.equal(radio.width, 160);
+});
+
 test('stand-in: wired keeps the hosts the bridges learned, with port, VLAN and seconds since heard', () => {
 	const [ r, none, many, bad ] = runShim(BEHAVIOUR.slice(27, 31));
 	assert.deepEqual(r.reply.hosts, [
@@ -422,6 +473,17 @@ test('ucode plugin: crowded bridges are counted, not dumped', { skip: NO_UCODE }
 	const dumped = spawnUcode([ { method: 'wired', fdb: 'no dump' } ], null, 0);
 	assert.notEqual(dumped.status, 0, 'the double does catch a dump');
 	assert.match(dumped.stderr, /rtnl stub: a dump where none may happen/);
+});
+
+test('ucode plugin: a broken rtnl dependency leaves the other dashboard methods available', { skip: NO_UCODE }, () => {
+	const cases = [ BEHAVIOUR[24], BEHAVIOUR[0], { method: 'wired', fdb: 'no dump' }, { method: 'thermal' } ];
+	const r = spawnUcode(cases, null, 3, true);
+	assert.equal(r.status, 0, r.stderr);
+	const replies = JSON.parse(r.stdout);
+	assert.deepEqual(replies.slice(0, 2), runShim(cases.slice(0, 2)), 'wireless and validated alias writes still work');
+	assert.deepEqual(replies[2].reply, { hosts: [] }, 'no forwarding dump without rtnl');
+	assert.equal(replies[3].status, 0);
+	assert.ok(Array.isArray(replies[3].reply.zones), 'temperature sensors remain available');
 });
 
 test('stand-in: the replay falls back to the store\'s uci wireless when network.wireless is missing or empty', () => {

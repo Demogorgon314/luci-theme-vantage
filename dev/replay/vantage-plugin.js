@@ -161,15 +161,24 @@ function uciTrue(v) {
    in config order; null without the config), as the plugin's
    wireless_from_config(): enabled interfaces that name their ifname, the
    first section per name, no run state, no txpower */
-function wirelessFromConfig(sections) {
+function wirelessFromConfig(sections, stateSections) {
 	const radios = new Map(), taken = new Set(), out = {};
 	const list = Array.isArray(sections) ? sections.filter(s => s && typeof s === 'object') : [];
-	for (const s of list)
+	for (const s of list) {
+		let htmode = s.htmode;
+		if ([ 'qcawifi', 'qcawificfg80211' ].includes(s.type) && /^11be[ag]?$/.test(s.hwmode) && /^HT(20|40|80|160|320)$/.test(htmode))
+			htmode = 'EHT' + htmode.slice(2);
 		if (s['.type'] === 'wifi-device' && /^[A-Za-z0-9_.-]{1,64}$/.test(s['.name']))
-			radios.set(s['.name'], { disabled: uciTrue(s.disabled), config: Object.assign({}, s, { txpower: null }), interfaces: [] });
+			radios.set(s['.name'], { disabled: uciTrue(s.disabled), config: Object.assign({}, s, { htmode, txpower: null }), interfaces: [] });
+	}
+	const runtime = new Map();
+	for (const s of (Array.isArray(stateSections) ? stateSections : []))
+		if (s && s['.type'] === 'wifi-iface' && [ 'qcawifi', 'qcawificfg80211' ].includes(radios.get(s.device)?.config.type))
+			runtime.set(s['.name'], { device: s.device, ifname: s.ifname });
 	for (const s of list) {
 		if (s['.type'] !== 'wifi-iface') continue;
-		const r = typeof s.device === 'string' ? radios.get(s.device) : null, ifname = s.ifname;
+		const r = typeof s.device === 'string' ? radios.get(s.device) : null, saved = runtime.get(s['.name']);
+		const ifname = s.ifname ?? (saved?.device === s.device ? saved.ifname : null);
 		if (!r || uciTrue(s.disabled) || typeof ifname !== 'string' || !/^[A-Za-z0-9_.-]{1,64}$/.test(ifname) || taken.has(ifname)) continue;
 		taken.add(ifname);
 		r.interfaces.push({ ifname, section: s['.name'],
@@ -183,8 +192,8 @@ function wirelessFromConfig(sections) {
    object is missing (status null), the wireless config */
 /* netifd's status, unless it is missing or skipped every radio (no
    handler for the vendor's driver type): then the config */
-function wirelessReply(status, sections) {
-	return (status && typeof status === 'object' && !Array.isArray(status) && Object.keys(status).length) ? reduceWireless(status) : wirelessFromConfig(sections);
+function wirelessReply(status, sections, stateSections) {
+	return (status && typeof status === 'object' && !Array.isArray(status) && Object.keys(status).length) ? reduceWireless(status) : wirelessFromConfig(sections, stateSections);
 }
 
 /* uci sections of one config from the store, in config order; null when

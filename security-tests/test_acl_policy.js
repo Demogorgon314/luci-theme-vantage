@@ -246,10 +246,11 @@ function checkPluginSource(src) {
 	assert.deepEqual([ ...src.matchAll(/^.*\bimport\b.*$/gm) ].map(m => m[0]), [
 		'import { cursor } from \'uci\';',
 		'import { connect } from \'ubus\';',
-		'import { lsdir, readfile } from \'fs\';',
-		'import * as rtnl from \'rtnl\';'
+		'import { lsdir, readfile } from \'fs\';'
 	]);
-	const word = /\b(system|popen|exec|require|loadfile|loadstring|include|render|writefile|unlink|global)\b/.exec(src);
+	const load = "try { rtnl = require('rtnl'); }";
+	assert.deepEqual([ ...src.matchAll(/^.*\brequire\b.*$/gm) ].map(m => m[0]), [ load ], 'only the optional rtnl module may be loaded');
+	const word = /\b(system|popen|exec|require|loadfile|loadstring|include|render|writefile|unlink|global)\b/.exec(src.replace(load, ''));
 	assert.equal(word, null, word && `"${word[1]}" is banned in the plugin, as a word${REWORD}`);
 	assert.doesNotMatch(src, /(^|[^.\w])call\s*\(/m, 'the call() builtin is banned in the plugin');
 	/* fs: only the thermal zones under /sys/class/thermal, and the
@@ -260,11 +261,10 @@ function checkPluginSource(src) {
 	assert.ok(fsCalls.length >= 5, 'found the fs calls');
 	for (const c of fsCalls) assert.match(c, /^(lsdir\(THERMAL$|readfile\(THERMAL \+ '\/' \+ n \+ '\/(temp|type)'|lsdir\(NET$|readfile\(NET \+ '\/' \+ n \+ '\/brforward')$/, c);
 
-	/* uci: two cursors made without arguments, `uci` on CONFIG ('vantage')
-	   and `wl`, which only loads and walks WIRELESS ('wireless'); every
-	   other mention of either name is one of those calls */
-	assert.deepEqual([ ...src.matchAll(/^.*\bcursor\b.*$/gm) ].map(m => m[0].trim()), [ 'import { cursor } from \'uci\';', 'let wl = cursor();', 'let uci = cursor();' ],
-		`"cursor" may appear only on its import and the two cursor() lines${REWORD}`);
+	/* uci writes CONFIG only; both persistent and QSDK runtime wireless
+	   handles may only load and walk WIRELESS. No other state directory. */
+	assert.deepEqual([ ...src.matchAll(/^.*\bcursor\b.*$/gm) ].map(m => m[0].trim()), [ 'import { cursor } from \'uci\';', 'let wl = cursor();', "let runtime_uci = cursor(null, '/var/state');", 'let uci = cursor();' ],
+		`"cursor" may appear only on its import and the three approved lines${REWORD}`);
 	const body = src.replace(/^.*\bcursor\b.*$/gm, '');
 	assert.match(src, /^const CONFIG = 'vantage';$/m);
 	const calls = [ ...body.matchAll(/\buci\b(?:\.(\w+)\(([^,)]*))?/g) ];
@@ -273,7 +273,9 @@ function checkPluginSource(src) {
 	assert.match(src, /^const WIRELESS = 'wireless';/m);
 	assert.deepEqual([ ...body.matchAll(/\bwl\b(?:\.(\w+)\(([^,)]*))?/g) ].map(m => m[0]), [ 'wl.load(WIRELESS', 'wl.foreach(WIRELESS', 'wl.foreach(WIRELESS' ],
 		`"wl" may appear only as wl.load(WIRELESS) and two wl.foreach(WIRELESS, ...)${REWORD}`);
-	assert.equal([ ...src.matchAll(/\bWIRELESS\b/g) ].length, 4, 'WIRELESS: its definition and the three wl calls');
+	assert.deepEqual([ ...body.matchAll(/\bruntime_uci\b(?:\.(\w+)\(([^,)]*))?/g) ].map(m => m[0]), [ 'runtime_uci.load(WIRELESS', 'runtime_uci.foreach(WIRELESS' ],
+		`"runtime_uci" may only load and walk wireless${REWORD}`);
+	assert.equal([ ...src.matchAll(/\bWIRELESS\b/g) ].length, 6, 'WIRELESS: definition and five read calls');
 
 	/* ubus: one connection for the one call, network.wireless status */
 	assert.deepEqual([ ...src.matchAll(/^.*\bconnect\b.*$/gm) ].map(m => m[0].trim()), [ 'import { connect } from \'ubus\';', 'let reply = connect()?.call(\'network.wireless\', \'status\');' ],
@@ -284,7 +286,7 @@ function checkPluginSource(src) {
 	   database; otherwise only constants are read */
 	const dump = 'let fdb = rtnl.request(rtnl.const.RTM_GETNEIGH, rtnl.const.NLM_F_DUMP, { family: rtnl.const.AF_BRIDGE });';
 	assert.deepEqual([ ...src.matchAll(/^.*\brtnl\.request\b.*$/gm) ].map(m => m[0].trim()), [ dump ], `"rtnl.request" may appear only as the one dump${REWORD}`);
-	const rest = src.replace(/^import \* as rtnl from 'rtnl';$/m, '').replace(dump, '');
+	const rest = src.replace('let rtnl = null;', '').replace(load, '').replace('if (!rtnl)', '').replace(dump, '');
 	for (const m of rest.matchAll(/\brtnl\b(?:\.const\.(\w+))?/g))
 		assert.ok([ 'NUD_PERMANENT', 'NUD_NOARP', 'NTF_SELF' ].includes(m[1]), `"${m[0]}": "rtnl" may appear only as rtnl.const.NUD_PERMANENT, NUD_NOARP or NTF_SELF${REWORD}`);
 }
@@ -300,6 +302,11 @@ test('the plugin source rules catch writes, other configs and calls, and names p
 		'fs write': plugin.replace('import { lsdir, readfile } from \'fs\';', 'import { lsdir, readfile, writefile } from \'fs\';'),
 		'cursor by reference': add('let mk = cursor; mk().commit(WIRELESS);'),
 		'cursor on a directory': plugin.replace('let uci = cursor();', 'let uci = cursor(\'/etc/init.d\');'),
+		'runtime cursor on another directory': plugin.replace("cursor(null, '/var/state')", "cursor(null, '/etc/init.d')"),
+		'write runtime wireless': add("runtime_uci.set(WIRELESS, 'x', 'disabled', '1');"),
+		'runtime cursor by reference': add('let s = runtime_uci;'),
+		'load another module': plugin.replace("require('rtnl')", "require('fs')"),
+		'load a second module': add("require('fs');"),
 		'third cursor': add('let w = cursor(); w.load(\'network\');'),
 		'write through wl': add('wl.set(WIRELESS, \'x\', \'encryption\', \'none\');'),
 		'wl by reference': add('let w2 = wl;'),

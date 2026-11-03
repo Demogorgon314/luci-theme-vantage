@@ -19,24 +19,25 @@ function find(sid) {
 	return null;
 }
 
-function sections(conf) {
-	return (conf == 'wireless') ? (global.STUB.wireless ?? []) : global.STUB.sections;
+function sections(conf, state) {
+	return (conf == 'wireless') ? ((state ? global.STUB.wireless_state : null) ?? global.STUB.wireless ?? []) : global.STUB.sections;
 }
 
 function cursor(...args) {
-	if (length(args))
+	let state = length(args) == 2 && args[0] == null && args[1] == '/var/state';
+	if (length(args) && !state)
 		die(sprintf('uci stub: cursor%J', args));
 
 	return {
 		load: function(conf) {
-			only(conf, [ 'vantage', 'wireless' ], 'load');
+			only(conf, state ? [ 'wireless' ] : [ 'vantage', 'wireless' ], 'load');
 			return conf == 'vantage' || global.STUB.wireless != null;
 		},
 
 		foreach: function(conf, stype, fn) {
-			only(conf, [ 'vantage', 'wireless' ], 'foreach');
+			only(conf, state ? [ 'wireless' ] : [ 'vantage', 'wireless' ], 'foreach');
 
-			for (let s in [ ...sections(conf) ])
+			for (let s in [ ...sections(conf, state) ])
 				if (!stype || s['.type'] == stype)
 					if (fn({ ...s }) === false)
 						break;
@@ -45,7 +46,7 @@ function cursor(...args) {
 		},
 
 		add: function(conf, stype) {
-			only(conf, [ 'vantage' ], 'add');
+			only(conf, state ? [] : [ 'vantage' ], 'add');
 
 			let sid = sprintf('cfg%06x', ++global.STUB.seq);
 			push(global.STUB.sections, { '.name': sid, '.type': stype, '.anonymous': true });
@@ -53,7 +54,7 @@ function cursor(...args) {
 		},
 
 		set: function(conf, sid, opt, val) {
-			only(conf, [ 'vantage' ], 'set');
+			only(conf, state ? [] : [ 'vantage' ], 'set');
 
 			let s = find(sid);
 
@@ -65,7 +66,7 @@ function cursor(...args) {
 		},
 
 		delete: function(conf, sid, opt) {
-			only(conf, [ 'vantage' ], 'delete');
+			only(conf, state ? [] : [ 'vantage' ], 'delete');
 
 			if (opt != null) {
 				let s = find(sid);
@@ -82,7 +83,7 @@ function cursor(...args) {
 		},
 
 		commit: function(conf) {
-			only(conf, [ 'vantage' ], 'commit');
+			only(conf, state ? [] : [ 'vantage' ], 'commit');
 
 			if (global.STUB.fail_commit)
 				return null;
@@ -92,7 +93,7 @@ function cursor(...args) {
 		},
 
 		revert: function(conf) {
-			only(conf, [ 'vantage' ], 'revert');
+			only(conf, state ? [] : [ 'vantage' ], 'revert');
 
 			global.STUB.reverted = true;
 			return true;

@@ -25,7 +25,7 @@ if (type(obj) != 'object')
 for (let c in cases) {
 	let orig = json(sprintf('%J', c.sections ?? []));
 
-	global.STUB = { sections: json(sprintf('%J', orig)), seq: 0, committed: false, reverted: false, fail_commit: !!c.fail_commit, ubus: c.ubus ?? {}, wireless: c.wireless_uci, fdb: c.fdb };
+	global.STUB = { sections: json(sprintf('%J', orig)), seq: 0, committed: false, reverted: false, fail_commit: !!c.fail_commit, ubus: c.ubus ?? {}, wireless: c.wireless_uci, wireless_state: c.wireless_state, fdb: c.fdb };
 
 	let m = obj[c.method], status = 0, reply = null;
 

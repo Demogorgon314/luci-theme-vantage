@@ -34,7 +34,12 @@
 import { cursor } from 'uci';
 import { connect } from 'ubus';
 import { lsdir, readfile } from 'fs';
-import * as rtnl from 'rtnl';
+
+// Vendor firmware can satisfy the package dependency while shipping an
+// incompatible libnl-tiny. Keep that failure local to wired host discovery.
+let rtnl = null;
+try { rtnl = require('rtnl'); }
+catch (e) {}
 
 const CONFIG = 'vantage';
 const WIRELESS = 'wireless';      // read only, by wireless_from_config()
@@ -261,19 +266,41 @@ function reduce_radio(r) {
 // drivers do not configure it in dBm (mtkwifi: per cent).
 function wireless_from_config() {
 	let wl = cursor();
-	let radios = {}, taken = {}, out = {};
+	let radios = {}, taken = {}, out = {}, qca = false, runtime = {};
 
 	if (!wl.load(WIRELESS))
 		return out;
 
 	wl.foreach(WIRELESS, 'wifi-device', (s) => {
+		let htmode = s.htmode;
+		// QSDK keeps the generation in hwmode and only the width in
+		// htmode (11bea + HT160). The view expects the combined EHT160.
+		if (s.type in [ 'qcawifi', 'qcawificfg80211' ] && type(s.hwmode) == 'string' &&
+		    match(s.hwmode, /^11be[ag]?$/) && type(htmode) == 'string' && match(htmode, /^HT(20|40|80|160|320)$/))
+			htmode = 'EHT' + substr(htmode, 2);
+
 		if (match(s['.name'], /^[A-Za-z0-9_.-]{1,64}$/))
-			radios[s['.name']] = { disabled: uci_true(s.disabled), config: { ...s, txpower: null }, interfaces: [] };
+			radios[s['.name']] = { disabled: uci_true(s.disabled), config: { ...s, htmode, txpower: null }, interfaces: [] };
+		if (s.type in [ 'qcawifi', 'qcawificfg80211' ])
+			qca = true;
 	});
+
+	// QSDK assigns VAP names when Wi-Fi starts and saves them as UCI
+	// state deltas. Only take the interface name, for the same section
+	// and radio; persistent configuration remains authoritative.
+	if (qca) {
+		let runtime_uci = cursor(null, '/var/state');
+		if (runtime_uci.load(WIRELESS))
+			runtime_uci.foreach(WIRELESS, 'wifi-iface', (s) => {
+				if (type(s.device) == 'string' && radios[s.device]?.config.type in [ 'qcawifi', 'qcawificfg80211' ])
+					runtime[s['.name']] = { device: s.device, ifname: s.ifname };
+			});
+	}
 
 	wl.foreach(WIRELESS, 'wifi-iface', (s) => {
 		let r = (type(s.device) == 'string') ? radios[s.device] : null;
-		let ifname = s.ifname;
+		let saved = runtime[s['.name']];
+		let ifname = s.ifname ?? ((saved?.device == s.device) ? saved.ifname : null);
 
 		if (type(r) != 'object' || uci_true(s.disabled) || type(ifname) != 'string' ||
 		    !match(ifname, /^[A-Za-z0-9_.-]{1,64}$/) || taken[ifname])
@@ -435,6 +462,9 @@ function crowded() {
 // bridge last heard from the host (the kernel counts in 1/100 s), null
 // for a static entry. null when a bridge is crowded.
 function wired() {
+	if (!rtnl)
+		return [];
+
 	if (crowded())
 		return null;
 

@@ -4,6 +4,11 @@
 // Constants as the kernel's.
 'use strict';
 
+// A module whose shared-library dependency cannot load must not prevent
+// the plugin from registering its other methods.
+if (global.RTNL_FAILURE)
+	require('vantage_rtnl_missing_dependency');
+
 const C = {
 	RTM_NEWNEIGH: 28, RTM_DELNEIGH: 29, RTM_GETNEIGH: 30,
 	NLM_F_DUMP: 0x300, AF_BRIDGE: 7,
@@ -21,4 +26,4 @@ function request(cmd, flags, msg) {
 	return global.STUB.fdb;
 }
 
-export { request, C as 'const' };
+return { request, 'const': C };
