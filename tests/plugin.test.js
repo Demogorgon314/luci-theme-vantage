@@ -47,7 +47,7 @@ function fakeNet(dir, entries) {
 	fs.mkdirSync(path.join(net, 'eth0'), { recursive: true });
 	BRIDGES.forEach((b, i) => {
 		fs.mkdirSync(path.join(net, b));
-		fs.writeFileSync(path.join(net, b, 'brforward'), Buffer.alloc(16 * n[i]));
+		fs.writeFileSync(path.join(net, b, 'brforward'), Buffer.isBuffer(n[i]) ? n[i] : Buffer.alloc(16 * n[i]));
 	});
 	return net;
 }
@@ -55,24 +55,34 @@ function fakeNet(dir, entries) {
 /* run cases through a plugin (the real one unless given its source),
    reading its bridges from a fake /sys/class/net with `entries` (default
    3) records on br-lan: the harness's spawnSync result */
-function spawnUcode(cases, source, entries, rtnlFailure) {
+function spawnUcode(cases, source, entries, rtnlFailure, sysfs) {
 	const dir = mkTmp('vantage-plugin-');
 	const file = path.join(dir, 'cases.json');
 	const plugin = path.join(dir, 'luci.vantage');
-	try {
-		const src = source == null ? fs.readFileSync(PLUGIN, 'utf8') : source;
-		fs.writeFileSync(file, JSON.stringify(cases));
-		fs.writeFileSync(plugin, src.replace(/^const NET = .*$/m, () => 'const NET = ' + JSON.stringify(fakeNet(dir, entries == null ? 3 : entries)) + ';'));
-		const args = [ '-L', path.join(__dirname, 'ucode/stubs') ];
-		const lib = path.join(path.dirname(UCODE), '../lib/ucode');
-		if (fs.existsSync(lib)) args.push('-L', lib);
-		if (rtnlFailure) args.push('-D', 'RTNL_FAILURE=true');
-		args.push('-D', 'PLUGIN=' + plugin, '-D', 'CASES=' + file, path.join(__dirname, 'ucode/harness.uc'));
-		return spawnSync(UCODE, args, { encoding: 'utf8' });
-	} finally {
-		for (const f of [ file, plugin ].concat(BRIDGES.map(b => path.join(dir, 'net', b, 'brforward')))) if (fs.existsSync(f)) fs.unlinkSync(f);
-		for (const d of BRIDGES.map(b => 'net/' + b).concat([ 'net/eth0', 'net', '' ])) if (fs.existsSync(path.join(dir, d))) fs.rmdirSync(path.join(dir, d));
+	const src = source == null ? fs.readFileSync(PLUGIN, 'utf8') : source;
+	const net = fakeNet(dir, entries == null ? 3 : entries);
+	const legacy = path.join(dir, 'libnl-tiny.so');
+	if (sysfs) {
+		fs.writeFileSync(legacy, Buffer.from([ 0x7f, 69, 76, 70, 2, sysfs.endian || 1 ]));
+		for (const [ bridge, ports ] of Object.entries(sysfs.ports || {})) {
+			fs.mkdirSync(path.join(net, bridge, 'brif'), { recursive: true });
+			for (const [ port, num ] of Object.entries(ports)) {
+				fs.writeFileSync(path.join(net, bridge, 'brif', port), '');
+				fs.mkdirSync(path.join(net, port, 'brport'), { recursive: true });
+				fs.writeFileSync(path.join(net, port, 'brport/port_no'), '0x' + num.toString(16) + '\n');
+			}
+		}
 	}
+	fs.writeFileSync(file, JSON.stringify(cases));
+	fs.writeFileSync(plugin, src.replace(/^const NET = .*$/m, () => 'const NET = ' + JSON.stringify(net) + ';')
+		.replace(/^const LEGACY_LIBNL = .*$/m, () => 'const LEGACY_LIBNL = ' + JSON.stringify(legacy) + ';'));
+	const args = [ '-L', path.join(__dirname, 'ucode/stubs') ];
+	const lib = path.join(path.dirname(UCODE), '../lib/ucode');
+	if (fs.existsSync(lib)) args.push('-L', lib);
+	if (rtnlFailure) args.push('-D', 'RTNL_FAILURE=true');
+	if (sysfs) args.push('-D', 'RTNL_FORBIDDEN=true');
+	args.push('-D', 'PLUGIN=' + plugin, '-D', 'CASES=' + file, path.join(__dirname, 'ucode/harness.uc'));
+	return spawnSync(UCODE, args, { encoding: 'utf8' });
 }
 
 /* run cases through the real plugin: [ { status, reply, sections } ] */
@@ -484,6 +494,47 @@ test('ucode plugin: a broken rtnl dependency leaves the other dashboard methods 
 	assert.deepEqual(replies[2].reply, { hosts: [] }, 'no forwarding dump without rtnl');
 	assert.equal(replies[3].status, 0);
 	assert.ok(Array.isArray(replies[3].reply.zones), 'temperature sensors remain available');
+});
+
+function sysfsEntry(mac, port, age, local, endian = 1) {
+	const record = Buffer.alloc(16);
+	Buffer.from(mac.replace(/:/g, ''), 'hex').copy(record);
+	record[6] = port & 255;
+	record[7] = local ? 1 : 0;
+	record[12] = port >> 8;
+	if (endian === 1) record.writeUInt32LE(age || 0, 8);
+	else record.writeUInt32BE(age || 0, 8);
+	return record;
+}
+
+test('ucode plugin: legacy libnl uses bounded sysfs hosts without loading the native module', { skip: NO_UCODE }, () => {
+	const run = (entries, options) => {
+		const r = spawnUcode([ { method: 'wired', fdb: 'no dump' } ], null, entries, false, options);
+		assert.equal(r.status, 0, r.stderr);
+		return JSON.parse(r.stdout)[0].reply;
+	};
+	for (const endian of [ 1, 2 ]) {
+		const data = Buffer.concat([
+			sysfsEntry('00:00:5e:00:53:01', 1, 1234, false, endian),
+			sysfsEntry('00:00:5e:00:53:02', 257, 30099, false, endian),
+			sysfsEntry('00:00:5e:00:53:03', 1, 0, true, endian),
+			sysfsEntry('01:00:5e:00:53:04', 1, 0, false, endian),
+			sysfsEntry('00:00:5e:00:53:05', 8, 0, false, endian),
+			Buffer.from([ 1, 2, 3 ])
+		]);
+		assert.deepEqual(run(data, { endian, ports: { 'br-lan': { lan1: 1, lan2: 257 } } }), { hosts: [
+			{ mac: '00:00:5e:00:53:01', port: 'lan1', bridge: 'br-lan', vlan: null, seen: 12 },
+			{ mac: '00:00:5e:00:53:02', port: 'lan2', bridge: 'br-lan', vlan: null, seen: 300 }
+		] });
+	}
+	const many = Buffer.concat(Array.from({ length: 600 }, (_, i) => sysfsEntry('00:00:5e:00:53:01', 1)));
+	assert.equal(run(many, { ports: { 'br-lan': { lan1: 1 } } }).hosts.length, 128);
+	const ports = { lan1: 1, lan2: 2, lan3: 3, lan4: 4, lan5: 5 };
+	const all = Buffer.concat(Array.from({ length: 700 }, (_, i) => sysfsEntry('00:00:5e:00:53:01', i % 5 + 1)));
+	assert.equal(run(all, { ports: { 'br-lan': ports } }).hosts.length, 512);
+	assert.equal(run(sysfsEntry('00:00:5e:00:53:01', 1, 1234), { endian: 3, ports: { 'br-lan': ports } }).hosts[0].seen, null);
+	assert.deepEqual(run([ 3000, 1100 ], {}), { hosts: [], crowded: true });
+	assert.deepEqual(run(Buffer.alloc(0), {}), { hosts: [] });
 });
 
 test('stand-in: the replay falls back to the store\'s uci wireless when network.wireless is missing or empty', () => {

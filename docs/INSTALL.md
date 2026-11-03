@@ -792,61 +792,33 @@ uci commit luci
   `ubus list luci.vantage` shows the object; `/etc/init.d/rpcd reload`
   loads a newly installed plugin.
 
-### Vendor firmware and missing wired devices
+### QWRT/QSDK: wired hosts and login sessions
 
-QWRT/QSDK and other vendor builds can mix newer LuCI packages with older
-system libraries. A package manager may report `ucode-mod-rtnl` and its
-dependencies as installed even though loading `rtnl` fails (for example,
-the firmware provides `libnl-tiny.so` while the module needs
-`libnl-tiny.so.1`). The plugin catches that load failure so wireless
-status, temperatures and device naming remain available. Wired hosts
-learned from the bridge forwarding database are omitted until a working
-`rtnl` module is available; an empty wired list does not prove that no
-wired devices are connected.
+QSDK can ship an older, unversioned `/usr/lib/libnl-tiny.so`. The plugin
+detects its ELF header and uses the kernel's `brforward` and
+`brif/*/brport/port_no` data to identify learned hosts and their ports.
+It does not load the native `rtnl` module on those images. A second libnl ABI
+in rpcd can cause a crash when `luci-rpc.getHostHints` runs after a netlink
+dump, invalidating all LuCI sessions. A successful standalone `ucode`
+module-load test does not establish safety inside rpcd.
 
-Check the module independently with:
+The sysfs reader keeps the same per-port and total host caps and crowded
+bridge protection. It decodes port numbers and ages on either endian
+architecture; ages stay unknown when there is no native ELF header to
+establish byte order. The legacy kernel format has no VLAN identifier, so
+VLANs stay unknown on this path. Images without this legacy library try
+`rtnl`; a module load failure also falls back to sysfs.
 
-```sh
-ucode -e 'require("rtnl"); print("rtnl loaded\n");'
-```
-
-Use a module and libraries built for your firmware to restore wired host
-discovery. Renaming a library or creating a soname symlink does not establish
-ABI compatibility. The app keeps its `ucode-mod-rtnl` dependency so standard
-OpenWrt installs continue to get wired host discovery automatically.
-
-#### QWRT/QSDK ARM64 compatibility package
-
-For `aarch64_cortex-a53` QWRT images with the older, unversioned
-`/usr/lib/libnl-tiny.so`, this fork supplies an optional companion package.
-It adds `libnl-tiny.so.1` under a separate package identity. QSDK's original
-library and its `libnl-tiny1` package stay in place. Do not use it on a
-different architecture or on firmware that already owns `libnl-tiny.so.1`.
-
-On your computer, from the repository root, with Python 3.9 or later:
+No additional library package is needed. If an earlier version of this
+fork installed `vantage-qwrt-libnl-compat`, remove it and reload rpcd after
+updating the plugin:
 
 ```sh
-python3 -m unittest discover -s tests -p qwrt_compat_test.py
-python3 dev/qwrt/build-libnl-compat.py
-scp -O dist/qwrt/vantage-qwrt-libnl-compat_*.ipk root@192.0.2.1:/tmp/
-```
-
-The builder verifies a pinned ImmortalWrt 24.10.6 package's SHA-256 before
-preserving its library payload byte for byte. It produces an opkg package
-and `SHA256SUMS` in `dist/qwrt/`. `--source /path/to/original.ipk` permits an
-offline build with the same checksum check. The library's source is
-[libnl-tiny at c0df580adbd4](https://git.openwrt.org/project/libnl-tiny.git).
-No router credentials or device data are used to build it.
-
-On the router, with `luci-app-vantage` and `ucode-mod-rtnl` installed:
-
-```sh
-opkg install /tmp/vantage-qwrt-libnl-compat_*.ipk
-ucode -e 'require("rtnl"); print("rtnl loaded\n");'
+opkg remove vantage-qwrt-libnl-compat
 /etc/init.d/rpcd reload
 ```
 
-This fork also reads QCA's interface names from `/var/state/wireless` when
+The fork also reads QCA's interface names from `/var/state/wireless` when
 netifd supplies no radio status. It accepts names only for the same UCI
 interface section and radio, and keeps SSIDs, encryption and disabled flags
 from the persistent configuration. No wireless settings are changed. The
@@ -854,11 +826,10 @@ browser still uses `iwinfo` to establish whether an interface is running.
 QSDK's split `hwmode=11bea`/`11beg` and `htmode=HT...` settings are reduced
 to the equivalent `EHT...` mode for Wi-Fi 7 generation and channel width.
 
-To remove the added library, run `opkg remove vantage-qwrt-libnl-compat`
-and reload rpcd. The dashboard will then omit bridge-learned hosts while
-the native module cannot load. This compatibility route has been checked
-on a QWRT QSDK 12.5 ARM64 image; other QWRT images need their own runtime
-validation.
+Runtime validation must include repeated complete dashboard polls,
+including CPU reads and host hints after wired discovery, while checking
+that the same login session and rpcd process survive. Single method calls
+do not cover this interaction.
 
 ### Realtime Graphs are empty
 

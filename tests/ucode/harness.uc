@@ -16,6 +16,8 @@ const TYPES = { string: 'string', int: 'int', double: 'double', bool: 'bool', ar
 
 let cases = json(readfile(CASES));
 let plugin = loadfile(PLUGIN, { raw_mode: true })();
+if (global.RTNL_FORBIDDEN && global.RTNL_LOADED)
+	die('legacy firmware must not load the native rtnl module');
 let obj = plugin?.['luci.vantage'];
 let out = [];
 

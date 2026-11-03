@@ -14,8 +14,9 @@
 //              Read group luci-app-vantage.
 //   wired      the hosts the Linux bridges have learned on their ports:
 //              MAC, port, bridge, VLAN and seconds since last heard, from a
-//              read-only netlink dump of the forwarding database; at most
-//              128 per port and 512 in all. Not dumped (crowded: true)
+//              read-only netlink dump, or sysfs on legacy vendor images
+//              (without VLAN information); at most 128 per port and 512
+//              in all. Not dumped (crowded: true)
 //              when the bridges hold FDB_LIMIT entries or more between
 //              them, counted first through sysfs without reading further: a flood of
 //              made-up addresses must not make rpcd build the whole
@@ -35,11 +36,17 @@ import { cursor } from 'uci';
 import { connect } from 'ubus';
 import { lsdir, readfile } from 'fs';
 
-// Vendor firmware can satisfy the package dependency while shipping an
-// incompatible libnl-tiny. Keep that failure local to wired host discovery.
+// QSDK's rpcd already uses an older libnl-tiny. Loading a second ABI can
+// crash its host-hint queries after a netlink dump. Use sysfs on those
+// images, even if a newer module can be loaded in isolation.
+const LEGACY_LIBNL = '/usr/lib/libnl-tiny.so';
+const libnl_header = readfile(LEGACY_LIBNL, 6) ?? '';
+const legacy_libnl = substr(libnl_header, 0, 4) == '\x7fELF';
 let rtnl = null;
-try { rtnl = require('rtnl'); }
-catch (e) {}
+if (!legacy_libnl) {
+	try { rtnl = require('rtnl'); }
+	catch (e) {}
+}
 
 const CONFIG = 'vantage';
 const WIRELESS = 'wireless';      // read only, by wireless_from_config()
@@ -455,6 +462,52 @@ function crowded() {
 	return false;
 }
 
+// Linux's legacy __fdb_entry ABI is 16 bytes: MAC[6], port low, local,
+// native-endian age[4], port high, padding[3]. It has no VLAN field.
+// Bound the second read too: the table can grow after crowded() counted it.
+function wired_sysfs() {
+	let out = [], per = {}, left = FDB_LIMIT * FDB_ENTRY;
+	let endian = legacy_libnl ? ord(libnl_header, 5) : 0;
+
+	for (let n in (lsdir(NET) ?? [])) {
+		if (!netdev(n))
+			continue;
+
+		let data = readfile(NET + '/' + n + '/brforward', left);
+		if (type(data) != 'string')
+			continue;
+		left -= length(data);
+		if (left <= 0)
+			return null;
+
+		let ports = {};
+		for (let p in (lsdir(NET + '/' + n + '/brif') ?? [])) {
+			if (!netdev(p))
+				continue;
+			let num = trim(readfile(NET + '/' + p + '/brport/port_no', 16) ?? '');
+			if (match(num, /^0x[0-9a-fA-F]{1,4}$/) && hex(num) > 0)
+				ports[hex(num)] = p;
+		}
+
+		for (let i = 0; i + FDB_ENTRY <= length(data); i += FDB_ENTRY) {
+			let port = ports[ord(data, i + 6) + 256 * ord(data, i + 12)];
+			if (!port || ord(data, i + 7) || (ord(data, i) & 1) || (per[port] ?? 0) >= MAX_PER_PORT)
+				continue;
+
+			let mac = join(':', map([ 0, 1, 2, 3, 4, 5 ], j => sprintf('%02x', ord(data, i + j))));
+			let age = 0;
+			for (let j = 0; j < 4; j++)
+				age = age * 256 + ord(data, i + 8 + (endian == 1 ? 3 - j : j));
+			push(out, { mac, port, bridge: n, vlan: null, seen: (endian in [ 1, 2 ]) ? int(age / 100) : null });
+			per[port] = (per[port] ?? 0) + 1;
+			if (length(out) >= MAX_HOSTS)
+				return out;
+		}
+	}
+
+	return out;
+}
+
 // [ { mac, port, bridge, vlan, seen } ] in dump order, at most MAX_HOSTS
 // and MAX_PER_PORT a port: what the bridges learned from their ports.
 // Left out: the bridges' own addresses (permanent), the switch drivers'
@@ -462,11 +515,11 @@ function crowded() {
 // bridge last heard from the host (the kernel counts in 1/100 s), null
 // for a static entry. null when a bridge is crowded.
 function wired() {
-	if (!rtnl)
-		return [];
-
 	if (crowded())
 		return null;
+
+	if (!rtnl)
+		return wired_sysfs();
 
 	let fdb = rtnl.request(rtnl.const.RTM_GETNEIGH, rtnl.const.NLM_F_DUMP, { family: rtnl.const.AF_BRIDGE });
 	let out = [], per = {};

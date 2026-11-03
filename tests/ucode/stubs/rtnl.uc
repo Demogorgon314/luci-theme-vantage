@@ -4,6 +4,8 @@
 // Constants as the kernel's.
 'use strict';
 
+global.RTNL_LOADED = true;
+
 // A module whose shared-library dependency cannot load must not prevent
 // the plugin from registering its other methods.
 if (global.RTNL_FAILURE)
