@@ -11,10 +11,11 @@ No fork of LuCI, rpcd, ucode or libnl is required for these changes.
 Download packages from this fork's
 [Releases](https://github.com/Demogorgon314/luci-theme-vantage/releases).
 The first release is `v1.0.12-qwrt.1`, with package version `1.0.12-r2`,
-based on upstream v1.0.12. Upstream v1.0.13 has not been integrated into
-this tested release baseline. The `qwrt` development branch now integrates
-upstream v1.0.13 as `1.0.13-r2`, with port traffic totals and swconfig switch
-details. That development code is not part of the `v1.0.12-qwrt.1` tag.
+based on upstream v1.0.12. The `qwrt` development branch now integrates
+upstream v1.0.14 as `1.0.14-r2`, including port traffic totals, swconfig
+switch details, mobile layout fixes and coexistence with LuCI's own
+dashboard. These development changes are not part of the
+`v1.0.12-qwrt.1` release tag.
 
 Runtime checks covered a QWRT QSDK 12.5 ARM64 image with QCA wireless
 drivers, modern LuCI/ucode, and opkg. Its advertised firmware version does
