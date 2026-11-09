@@ -37,14 +37,6 @@ return baseclass.extend({
 		return out.length > maxLen ? out.slice(out.length - maxLen) : out;
 	},
 
-	/* a round axis maximum >= v: 1, 2, 2.5, 5 x 10^n */
-	niceMax: function(v) {
-		if (!finite(v) || v <= 0) return 1;
-		var e = Math.pow(10, Math.floor(Math.log10(v))), f = v / e;
-		var n = f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10;
-		return n * e;
-	},
-
 	/* a round axis maximum >= v with finer steps (1, 1.5, 2, 2.5, 3, 4,
 	   5, 6, 8, 10 x 10^n), so a 374 Mbit/s peak gets a 400 axis, not 500 */
 	niceCeil: function(v) {
@@ -131,6 +123,14 @@ return baseclass.extend({
 	   Linear scales never go below CHART_FLOOR, so an idle link stays a
 	   flat line, and round up with niceCeil. */
 	CHART_STYLES: [ 'overlay', 'log', 'mirror', 'mirror-split', 'lanes' ],
+
+	/* the style in force: the router's first for a login that may save
+	   there, for any other only where this browser has none */
+	chartPick: function(saved, mine, first) {
+		var ok = this.CHART_STYLES;
+		if (ok.indexOf(saved) >= 0 && (first || ok.indexOf(mine) < 0)) return saved;
+		return ok.indexOf(mine) >= 0 ? mine : ok[0];
+	},
 	CHART_FLOOR: 1e4,
 
 	chartGeom: function(style, peakDn, peakUp) {

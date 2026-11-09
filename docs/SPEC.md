@@ -33,12 +33,18 @@ port in one click, finding anything by typing — not from their look.
 
 | Package | Contents | Depends |
 |---|---|---|
-| `luci-theme-vantage` | ucode templates, CSS, icons, `menu-vantage.js` (shell: rail, top bar, palette, tabs, indicators), login page | `+luci-base` |
+| `luci-theme-vantage` | ucode templates, CSS, icons, `menu-vantage.js` (shell: rail, top bar, palette, tabs, indicators), login page, its rpcd ACL (`/etc/config/vantage_theme` only), that config | `+luci-base` |
 | `luci-app-vantage` | dashboard + inspector views under `admin/dashboard` (landing page), its rpcd ACL (reads + its own config only), its rpcd ucode plugin `luci.vantage` (key-free wireless status, temperatures, the bridges' wired hosts, validated alias writes), `/etc/config/vantage` | `+luci-base +rpcd +rpcd-mod-iwinfo +rpcd-mod-ucode +ucode-mod-uci +ucode-mod-ubus +ucode-mod-fs +ucode-mod-rtnl` (rpcd-mod-iwinfo, ucode-mod-fs and ucode-mod-rtnl beyond luci-base; Wi-Fi images already have rtnl, as wifi-scripts needs it); reverse DNS (`rpcd-mod-rrdns`), mDNS (`umdns`) and hostapd's ubus objects are optional and degrade |
 
-The theme is useful alone; the app works under any theme but is designed
-for Vantage. Names used everywhere: theme dir `vantage`, media URL
-`/luci-static/vantage`, uci `luci.themes.Vantage`, config `/etc/config/vantage`.
+The theme is useful alone; the app alone works under any theme but is
+designed for Vantage. With both installed and another theme selected, the
+dashboard steps aside: `admin/dashboard` opens LuCI's own landing page
+instead (`luci-mod-dashboard`'s Status → Dashboard, else Status →
+Overview). The view decides this in the browser, because LuCI caches the
+menu tree across theme switches; a HEAD request for the theme's
+`menu-vantage.js` tells whether the theme is installed. Names used
+everywhere: theme dir `vantage`, media URL `/luci-static/vantage`, uci
+`luci.themes.Vantage`, config `/etc/config/vantage`.
 
 ## 3. Theme v1
 
@@ -47,17 +53,54 @@ for Vantage. Names used everywhere: theme dir `vantage`, media URL
 - **Icon rail** (left, 56 px) with the top-level categories from
   `ui.menu`; hover/click opens a **flyout** of that category's pages;
   the rail can be pinned open with labels (remembered per browser).
-- **Top bar**: breadcrumb (Category › Page › Tab), **command palette**
+- **Top bar**: breadcrumb (Category › Page › Tab; a crumb that only
+  repeats the one before it, "System › System", is shown once, with the
+  deeper link), **command palette**
   (Ctrl+K or `/`): fuzzy search over every menu page, recent pages first;
   later the app registers entities (clients, interfaces, radios) into it.
 - **Indicators** as pills; the unsaved-changes count is prominent and
   opens the changes dialog. When the bar runs short of room the host
-  chip gives way first, and at 900 px and below the pills shrink to a
-  dot and a count, so the breadcrumb is cut last.
+  chip gives way first, and at 900 px and below the pills shrink (the
+  auto-refresh pill to a pause or play sign, the changes pill to its
+  count), so the breadcrumb is cut last. The auto-refresh dot is the only
+  thing in the shell that pulses: a slow, soft ring while refreshing, still
+  while paused, and fast while the dashboard reports a problem: amber while
+  it reconnects or warns, red for an error.
 - **Host chip**: hostname · model (board name when the model string is a
-  placeholder), from `system board` via rpc in the menu script.
-- **Theme toggle**: auto / light / dark, stored in `localStorage`, applied
-  in `<head>` before CSS (no flash), exposed as `html[data-darkmode]`.
+  placeholder), from `system board` via rpc in the menu script; a name
+  the other contains (compared without case and punctuation) is left
+  out.
+- **Theme toggle**: auto / light / dark, applied in `<head>` before CSS
+  (no flash), exposed as `html[data-darkmode]`. Appearance (this mode, what
+  shows next to the logo after login, the login and network path
+  backgrounds) is saved on the router for every
+  browser, in `/etc/config/vantage_theme` (section `appearance`), by
+  sessions holding the theme's rpcd group `luci-theme-vantage` (uci `set`,
+  `commit` and `revert` on that config only; rpcd refuses commit and
+  revert alike while a rollback is pending, so a save starts with a
+  revert and stops there, leaving nothing in the session); the
+  templates pass only known values on, as `data-vt-look-*`, and
+  `data-vt-look-save` says whether this login may save: `yes`, `relogin`
+  (rpcd would grant the group at a new login, and no reload of rpcd has
+  given it to this one yet; the install's reload reaches open logins) or
+  `no`. Saves queue and only the latest pick is written. A
+  pick made without the group stays in that browser (`localStorage`,
+  `vantage.<name>.own`) and wins there, but not for a login that may save
+  (those keys are dropped); Appearance says when picks stay in the
+  browser. This browser's last pick (`vantage.theme`, `vantage.login`,
+  `vantage.backdrop.v1`, what the dashboard reads under another theme)
+  counts until the router has one. The dashboard's chart style and layouts
+  go the same way, in options `chart` and `layout_<class>[_wired]`: Done
+  under Customize saves what it changed and the router doesn't have yet
+  (`vantage.view.unsaved`, kept across a failed save or a reload; until
+  then this browser's copy stands), by handing it to the theme (`vantage:view-save`), which writes it once. If
+  that fails Customize stays open with a note: Done tries again, and Esc
+  or the Customize button leaves without saving.
+  The template passes them on as `data-vt-look-chart` and
+  `data-vt-look-layout`, logged in only and in their form only, and
+  `vantage.layout` validates them again. The router's come first for a
+  login that may save; any other keeps this browser's, and sees the
+  router's where it has none. Without the theme they stay in the browser.
 - **Tabs**: one segmented control for every level: the menu's page tabs
   (depth ≥ 3, at the top of the content column), tabs at page level, in a
   form or modal, and tabs inside a tab. Nesting shows by where a control
@@ -95,8 +138,10 @@ for Vantage. Names used everywhere: theme dir `vantage`, media URL
 
 ### Pages
 
-- Own **login** (`sysauth.ut`): brand, hostname, generic error, contract-
-  correct form. No system information for unauthenticated visitors.
+- Own **login** (`sysauth.ut`): the mark and the router's hostname as the
+  heading ("Authorization Required" without one), as LuCI's Bootstrap
+  shows it too; generic error, contract-correct form. No other system
+  information (no model or version) for unauthenticated visitors.
 - All core widgets per contract §5 (dropdown state machine, tabs, modals
   incl. apply countdown, tooltips, dynlist, progress bars, file browser,
   notifications with real fade-out transition, changes dialog).
@@ -125,7 +170,8 @@ for Vantage. Names used everywhere: theme dir `vantage`, media URL
   (header row, memory and storage meters) and named table sections whose
   name is only the row's `data-title` (drawn as the name cell, the card
   title on phones). These rules match nothing on 25.12.
-- 404 / CSRF pages render in the theme without leaking anything.
+- 404 / CSRF pages render in the theme without leaking anything. A
+  logged-in 404 is titled "Not found", in the crumbs and the page title.
 - Focused fields show a 2 px `--focus` outline (border plus ring, at
   least 3:1 against field and card in both modes); text on coloured
   fills (danger buttons, error and info tooltips) uses an ink colour that
@@ -147,12 +193,14 @@ for Vantage. Names used everywhere: theme dir `vantage`, media URL
   when the screen or the phone bar leaves no room below, and on the
   roomier side, scrolling, when neither side fits.
 - **Firewall**: a rule's or forward's verdict is a coloured badge (accept
-  green, reject and drop red, forward and NAT blue) and zone or default
-  policies are coloured in their dropdowns, both keyed on LuCI's raw
+  green, reject and drop red, forward and NAT blue), keyed on LuCI's raw
   target values, never on the translated labels; badge and warning text
-  keeps 4.5:1 on a hovered row too. Green means "passes", not "safe": on
-  the masquerading (internet-facing) zone, an accepting input policy and
-  any forwarding into another zone get the warning colour instead. A
+  keeps 4.5:1 on a hovered row too. Zone and default policies stay plain
+  (reject and drop are the safe values, accept between your own zones is
+  normal), except the one that is a risk: the masquerading
+  (internet-facing) zone accepting input, in the error colours, as on
+  the Overview tab; a forwarding from it into another zone is outlined
+  in the warning colour. A
   rule that is switched off is greyed (not faded, so its name and match
   keep 4.5:1) from the moment it is unticked. The match reads From/To
   first, the family/protocol line quieter. The zones table's long
@@ -183,7 +231,7 @@ text around it so it looks the same size.
 ## 4. App v1 (`luci-app-vantage`)
 
 - **Overview**: device card (model, firmware, uptime, CPU, memory, temp
-  if available), uplink card (resolved uplink interface, address, rate),
+  if available), uplink card (the main line's interface, address, rate),
   radios card (band, channel, width, tx power, utilisation, client count),
   clients card (count by band, weakest signals), health score. The
   Clients tile lists Wi-Fi stations or wired hosts, switched in its head
@@ -201,7 +249,8 @@ text around it so it looks the same size.
   "Port 1"); with one of them linked, its hosts get
   that port's speed instead of the CPU port's. The network
   path adds a Wired branch, a node per port with the port's traffic, for
-  hosts downstream of the device (not those on the uplink's port).
+  hosts downstream of the device (not those on the uplink's port), with
+  or without Wi-Fi.
 - **Inspectors** (drawer or page, deep-linkable):
   client (MAC, host hint, IP, radio/SSID, signal history for the session,
   rates, inactive time), radio (channel, width, noise when real, clients),
@@ -225,17 +274,34 @@ text around it so it looks the same size.
   command palette.
 - **Health**: simple, explainable scores (e.g. signal < −75 dBm, uplink
   down, memory > 90 %, radio disabled) each with a one-line reason and a
-  link to the page that fixes it.
+  link to the page that fixes it. Each card carries its own icon (port,
+  CPU, memory, Wi-Fi, signal, storage), plain while all is well and in
+  the level's colour when it needs attention, and a small picture on its
+  bottom edge: the last five minutes of uplink traffic and CPU, how full
+  memory (in use, then cache) and storage are, each radio's airtime where
+  the driver reports it, and the clients by signal class.
 - **Layout**: tiles are packed into columns (four, two or one by width);
   each tile has a column, a width and a place in the order, and stacks
   under the earlier tiles in its columns. "Customize" lets the viewer drag
   tiles, move them with buttons or arrow keys, change their width within
-  a per-tile minimum and hide them. Saved in `localStorage` per screen
-  class (and separately for wired devices), validated on read; never on
-  the device. A tile whose content shrinks keeps its height for 30 s,
+  a per-tile minimum and hide them. Saved per screen class (and
+  separately for wired devices) and validated on read: under the Vantage
+  theme with the chart style on the router (see the theme toggle), else
+  in `localStorage`, which also keeps this browser's copy. A tile whose
+  content shrinks keeps its height for 30 s,
   then the layout settles on its own; while arranging, each tile's
   content starts below its handle bar.
-- **Throughput chart**: one row per link (uplink, then each radio), each
+- **Lines to the internet**: every up interface with a default route in
+  the main table is a line, the main one first and at most four beside it.
+  Lines rank by lowest metric; on a tie the kernel's own answer
+  (`luci.vantage routes`) decides, then the name. wan6 on wan's device and
+  IPv6 on the port under PPPoE are part of their line, and so is 6rd, 6in4
+  or 6to4 IPv6 when there's only one line. A softwire (DS-Lite, MAP-E, 464XLAT) carries the line's IPv4. A VPN
+  that holds the route ordinary traffic takes is a full tunnel, drawn as a
+  pipe on the line it leaves by, and is not a line of its own. PPPoE counts
+  on the port under the session, since flow offloading takes downloads past
+  the session's own counters; lines sharing a port keep their own.
+- **Throughput chart**: one row per line, then each radio, each
   with its own scale. Under "Customize", the viewer picks how download and
   upload share a row: overlaid on one scale (the default), overlaid on a
   log scale (a grid line per ×10 from 1 kbit/s to at least 1 Mbit/s),
@@ -243,10 +309,12 @@ text around it so it looks the same size.
   separate lanes. Linear scales never go below 10 kbit/s, so an idle link
   stays flat. Lines are smoothed without overshooting a sample; a stretch
   without samples (page hidden, failed polls) is hatched as "no data".
-  The pick is saved in `localStorage`, validated on read; the tile's size
-  and place don't change with it.
+  The pick is saved with the layout and validated on read; the tile's
+  size and place don't change with it.
 - **Network path background**: behind the path, on its dot grid, one
-  canvas in the style picked under "Customize", the login page's two:
+  canvas in the style picked under the theme's Appearance (or under
+  "Customize" when the dashboard runs without the Vantage theme), the
+  login page's two:
   grid packets (the default; downloads run from the gateway's side,
   uploads back, more and faster with the uplink's live rate, from a
   couple at idle to 36 at 1 Gbit/s) or a starfield streaming out of this
@@ -256,8 +324,9 @@ text around it so it looks the same size.
   it is drawn, not on every display refresh), and stops while another
   window has the focus, the tab is hidden, the tile is out of view or
   folded; with
-  reduced motion it is one still frame. Saved in `localStorage` like the
-  chart style.
+  reduced motion it is one still frame. Under the Vantage theme it is
+  saved with the theme's Appearance (on the router for every browser);
+  otherwise in `localStorage` like the chart style.
 - **Firewall overview** (Network → Firewall → Overview, first tab):
   read-only, from uci `firewall`, read the way firewall4 (fw4, as 25.12
   ships it) reads it: its boolean spellings (1/on/true/yes, 0/off/false/
@@ -326,14 +395,20 @@ text around it so it looks the same size.
   intended, since the dashboard only gets about 600–700 px there and its
   two-column tiles clip below that (measured).
 - Polling via `poll.add` with sane intervals; pauses when the tab is hidden.
+  The full poll runs every 5 s; uplink traffic and CPU have a lane of
+  their own every 2 s (`/proc/stat` and the uplink device's counters,
+  about 3 KB a reply), with their own previous samples. While that lane
+  answers, the full poll leaves both to it; if it stops, the full poll
+  samples them again.
   A poll updates only what changed and lays nothing out unless a tile
-  changes size. Idle animations (the Live beat, the flow on busy wires)
+  changes size. Idle animations (the status circle's ring, the Live beat,
+  the flow on busy wires)
   use transform and opacity only, so the compositor runs them; with
   reduced motion they stop and busy wires show a static dotted line.
-- ACL: three groups. `luci-app-vantage` (read): `system info/board`,
+- ACL: three groups for the app, and the theme's own, below. `luci-app-vantage` (read): `system info/board`,
   `network.interface dump`, `network.device status`, `iwinfo
   info/assoclist`, `hostapd.* get_status/get_clients`, `luci-rpc
-  getHostHints`, `luci.vantage wireless/thermal/wired`, `umdns hosts`, `file read` of
+  getHostHints`, `luci.vantage wireless/thermal/wired/routes`, `umdns hosts`, `file read` of
   `/proc/stat`, `uci get` for `vantage`, and LuCI's own `luci
   getSwconfigPortState` (the link state of a swconfig switch's ports: LuCI
   runs `swconfig dev <switch> show`, the switch name quoted; the view asks
@@ -343,7 +418,8 @@ text around it so it looks the same size.
   apart because its caller chooses the DNS server and port; the view
   checks the grant and skips reverse DNS without it.
   `luci-app-vantage-names` (write): `luci.vantage set_alias` only; no
-  group grants uci writes. The firewall overview's menu entry depends on
+  group of the app grants uci writes. `luci-theme-vantage` (write): uci
+  `set`, `commit` and `revert` on `/etc/config/vantage_theme`. The firewall overview's menu entry depends on
   LuCI's `luci-app-firewall` group, whose holder already reads and
   changes `firewall`; it reads that config with `uci get` (and the
   interfaces with `network.interface dump`, which LuCI's
@@ -369,7 +445,18 @@ text around it so it looks the same size.
   no more than 4,096 records in all, and dumps nothing (`crowded: true`)
   when they hold that many between them: a flood of made-up addresses
   must not make rpcd build the whole table. The bridge forgets a host after about five
-  minutes without traffic. Where `network.wireless status` answers with
+  minutes without traffic.
+  `routes` returns the default route the kernel takes to the internet,
+  for IPv4 and IPv6 (family, device and metric; no gateways): one
+  read-only lookup a family (RTM_GETROUTE with RTM_F_FIB_MATCH, as `ip
+  route get fibmatch`) of a documentation address no network uses, kept
+  when the answer is a unicast default route in the main table; the work
+  does not grow with the routing table. `routes` is null when a lookup
+  could not be sent. netifd's interface dump lists the routes it asked
+  for; of two with the same metric the kernel keeps the one added last,
+  and a VPN daemon may add its own: the network path needs the kernel's
+  answer to tell whether a full-tunnel VPN or its line carries ordinary
+  traffic. Where `network.wireless status` answers with
   no radios at all, `wireless` reads the configuration too.
   `set_alias({mac, name, icon})`
   re-applies the view's rules on the device (unicast MAC, name of at most
@@ -383,12 +470,16 @@ text around it so it looks the same size.
   each behind a separate narrow write ACL and a confirmation;
   optional rpcd plugin keeping a small ring buffer for history, alerts.
 - **v3**: topology view, luci-app-statistics integration.
+- **Low-performance mode** ("potato mode", #101): poll what changes
+  slowly (wired hosts, temperatures, radio details) every 30 s instead of
+  every 5 s, and the rest less often, for routers where a refresh costs
+  noticeable CPU.
 
 ## 6. Security requirements
 
 - Templates escape everything request-derived; never echo `fuser`; the
   theme's own markup for unauthenticated renders (login, 404, CSRF) adds
-  nothing about the device. Not in the theme's control: LuCI's core
+  nothing about the device but the login page's hostname. Not in the theme's control: LuCI's core
   `header.ut` prints `L = new LuCI({...})` after the theme header on every
   page, with the LuCI build and package-database time in the `luci.js`
   URL and `nodespec: dispatched`, which on an anonymous 404 is the whole

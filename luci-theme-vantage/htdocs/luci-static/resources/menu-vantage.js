@@ -26,6 +26,49 @@ const callWirelessDevices = rpc.declare({ object: 'luci-rpc', method: 'getWirele
 const THEME_KEY = 'vantage.theme';
 const RAIL_KEY = 'vantage.rail';
 const LOGIN_KEY = 'vantage.login';      /* read by the login page's login.js */
+/* the dashboard's network path backdrop (luci-app-vantage view/vantage/overview.js),
+   picked here when the dashboard is installed; the dashboard listens for BACKDROP_EVENT */
+const BACKDROP_KEY = 'vantage.backdrop.v1';
+const BACKDROP_EVENT = 'vantage:backdrop';
+/* Appearance for every browser: saved on the router, in
+   /etc/config/vantage_theme (section appearance), by whoever may (rpcd
+   group luci-theme-vantage); header.ut and sysauth.ut hand its values over
+   as data-vt-look-<name>, and data-vt-look-save says whether this login
+   may save: 'yes', 'relogin' (it would at a new login: one from before
+   the group existed) or 'no'. A pick made without that right stays in
+   this browser (the own key) and wins here, but not for a login that may
+   save (those keys are dropped then); this browser's last pick (the old
+   key, also what the dashboard reads under another theme) counts until
+   the router has one. */
+/* this package's version, as its Makefile has it (tests/version.test.js) */
+const VERSION = '1.0.17-r2';
+/* Check for updates (Appearance): when asked, never on its own, the browser
+   reads the project's 24.10 package list on GitHub Pages (the same release
+   as 25.12's), without cookies or a referrer. Only a version number passes;
+   the link is a constant, to the latest release. */
+const UPDATE_INDEX = 'https://demogorgon314.github.io/luci-theme-vantage/24.10/Packages';
+
+const LOOK = {
+	theme: { own: 'vantage.theme.own', before: THEME_KEY, ok: [ 'auto', 'light', 'dark' ] },
+	login: { own: 'vantage.login.own', before: LOGIN_KEY, ok: [ 'grid', 'stars', 'none' ] },
+	backdrop: { own: 'vantage.backdrop.own', before: BACKDROP_KEY, ok: [ 'grid', 'stars', 'none' ] },
+	/* what shows next to the logo; the hostname and model come from system board */
+	brand: { own: 'vantage.brand.own', before: 'vantage.brand', ok: [ 'none', 'hostname', 'model' ] }
+};
+const LOOK_SYNC = 'vantage.look';         /* another tab saved one: { name, value } */
+const LOOK_SET_EVENT = 'vantage:backdrop-set';   /* the dashboard's own picker hands its pick over */
+/* The dashboard's Customize saves its chart style and layouts with the
+   Appearance, in one write when it is done: { values, done(ok) }. The
+   template reads them back with these same rules. */
+const VIEW_SAVE_EVENT = 'vantage:view-save';
+const VIEW_CHARTS = [ 'overlay', 'log', 'mirror', 'mirror-split', 'lanes' ];
+const VIEW_LAYOUT = /^(default|[a-z]{1,8}:[0-3]:[1-4](:h)?( [a-z]{1,8}:[0-3]:[1-4](:h)?){0,7})$/;
+const callLookSet = rpc.declare({ object: 'uci', method: 'set', params: [ 'config', 'section', 'values' ], reject: true });
+const callLookCommit = rpc.declare({ object: 'uci', method: 'commit', params: [ 'config' ], reject: true });
+/* While an apply awaits its rollback, rpcd refuses commit and revert alike, but not set: a pick set
+   then could not be taken back, and would go out unseen with the next Save & Apply. So a save starts
+   with this revert, which has nothing to undo and is refused in just that case. */
+const callLookRevert = rpc.declare({ object: 'uci', method: 'revert', params: [ 'config' ], reject: true });
 
 /* 24px stroke icons, drawn for this theme: constant [tag, attributes] lists,
    built with createElementNS (no markup parsing, no user data) */
@@ -41,13 +84,12 @@ const ICONS = {
 	generic: [ [ 'circle', { cx: '12', cy: '12', r: '8' } ], [ 'circle', { cx: '12', cy: '12', r: '2.2' } ] ],
 	page: [ [ 'path', { d: 'M7 3.5h6.5l4.5 4.5v12.5H7z' } ], [ 'path', { d: 'M13.5 3.5V8H18' } ] ],
 	caret: [ [ 'path', { d: 'm9 6 6 6-6 6' } ] ],
-	enter: [ [ 'path', { d: 'M19 5v6a3 3 0 0 1-3 3H6M10 10l-4 4 4 4' } ] ],
+	down: [ [ 'path', { d: 'm6 9 6 6 6-6' } ] ],
 	search: [ [ 'circle', { cx: '11', cy: '11', r: '6.5' } ], [ 'path', { d: 'm16 16 4.5 4.5' } ] ],
 	sun: [ [ 'circle', { cx: '12', cy: '12', r: '4' } ], [ 'path', { d: 'M12 2.5v2M12 19.5v2M4.6 4.6 6 6M18 18l1.4 1.4M2.5 12h2M19.5 12h2M4.6 19.4 6 18M18 6l1.4-1.4' } ] ],
 	moon: [ [ 'path', { d: 'M19.5 14.5A7.5 7.5 0 0 1 9.5 4.5a7.5 7.5 0 1 0 10 10z' } ] ],
 	auto: [ [ 'circle', { cx: '12', cy: '12', r: '8' } ], [ 'path', { d: 'M12 4a8 8 0 0 1 0 16z', 'class': 'vt-fill' } ] ],
 	logout: [ [ 'path', { d: 'M14 4h4.5A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5H14' } ], [ 'path', { d: 'M10 8l-4 4 4 4M6 12h10' } ] ],
-	pin: [ [ 'path', { d: 'M4 5v14M9 12h11M15 7l5 5-5 5' } ] ],
 	info: [ [ 'circle', { cx: '12', cy: '12', r: '8.5' } ], [ 'path', { d: 'M12 11v5.5' } ], [ 'circle', { cx: '12', cy: '7.75', r: '.6' } ] ],
 	more: [ [ 'circle', { cx: '5.5', cy: '12', r: '.9' } ], [ 'circle', { cx: '12', cy: '12', r: '.9' } ], [ 'circle', { cx: '18.5', cy: '12', r: '.9' } ] ]
 };
@@ -121,6 +163,48 @@ function svg(name, size) {
 }
 
 function storageGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+
+/* Compare the upstream version first, then the fork's package revision. */
+function versionParts(v) {
+	const m = /^(\d{1,4}(?:\.\d{1,4}){1,3})(?:-r(\d{1,4}))?$/.exec(String(v == null ? '' : v));
+	return m ? { version: m[1].split('.').map(Number), release: +(m[2] || 0) } : null;
+}
+function newerVersion(a, b) {
+	for (let i = 0; i < Math.max(a.version.length, b.version.length); i++)
+		if ((a.version[i] || 0) !== (b.version[i] || 0)) return (a.version[i] || 0) > (b.version[i] || 0);
+	return a.release > b.release;
+}
+/* Keep the revision: QWRT fixes can ship on the same upstream version. */
+function listedVersion(text) {
+	const block = String(text || '').split(/\n\s*\n/).find(b => /^Package: luci-theme-vantage$/m.test(b));
+	const m = block && /^Version: (\S+)$/m.exec(block);
+	return m && versionParts(m[1]) ? m[1] : null;
+}
+
+/* the value in force, from [ pending, own, router, before ]: the first
+   the theme knows, else the first choice (the default); the templates'
+   inline scripts and login.js do the same without the pending one */
+function lookValue(ok, list) {
+	for (const v of list) if (ok.indexOf(v) >= 0) return v;
+	return ok[0];
+}
+function lookWrite(values) {
+	return callLookRevert('vantage_theme')
+		.then(() => callLookSet('vantage_theme', 'appearance', values))
+		.then(() => callLookCommit('vantage_theme').catch(e => callLookRevert('vantage_theme').then(() => { throw e; }, () => { throw e; })));
+}
+function viewValue(name, value) {
+	if (name === 'chart') return VIEW_CHARTS.indexOf(value) >= 0;
+	return /^layout_(wide|mid|narrow)(_wired)?$/.test(name) && typeof value === 'string' && VIEW_LAYOUT.test(value);
+}
+
+/* the router's value of one, as the templates set it (literal names) */
+function setLookAttr(root, name, value) {
+	if (name === 'theme') root.setAttribute('data-vt-look-theme', value);
+	else if (name === 'login') root.setAttribute('data-vt-look-login', value);
+	else if (name === 'backdrop') root.setAttribute('data-vt-look-backdrop', value);
+	else if (name === 'brand') root.setAttribute('data-vt-look-brand', value);
+}
 function storageSet(k, v) { try { if (v == null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) {} }
 
 function isTyping(el) {
@@ -174,6 +258,54 @@ function highlight(text, idx) {
 	return out;
 }
 
+/* A path ("Network › Firewall") matches only on what it says: the query
+   as a substring, or each of its words starting a word of the path. Not
+   as letters scattered across it ("wire" in "Network › Firewall").
+   null = no match. */
+function pathScore(query, path) {
+	const q = query.toLowerCase().trim().replace(/\s+/g, ' ');
+	const t = String(path || '').toLowerCase();
+	if (!q || !t) return null;
+	const at = t.indexOf(q);
+	if (at >= 0) return (at === 0 || /[\s\/›\-_(.]/.test(t[at - 1])) ? 10 : 6;
+	const words = t.split(/[\s\/›\-_(.]+/).filter(Boolean);
+	return q.split(' ').every(w => words.some(x => x.startsWith(w))) ? 4 : null;
+}
+
+/* Palette results for a query, best first: entries whose title matches,
+   or only when no title does, those whose path does. Equal scores go to
+   the shallower entry (Network › Wireless before a Wireless tab). */
+function rankPalette(query, pool) {
+	const onTitle = [], onPath = [];
+	for (const e of pool) {
+		const t = fuzzy(query, e.title);
+		if (t) { onTitle.push({ e, score: t.score, idx: t.idx }); continue; }
+		const p = pathScore(query, e.path);
+		if (p != null) onPath.push({ e, score: p, idx: [] });
+	}
+	const depth = r => (r.e.segs || []).length;
+	return (onTitle.length ? onTitle : onPath).sort((a, b) => (b.score - a.score) || (depth(a) - depth(b)));
+}
+
+/* The palette without a query: rows under their category's header, which
+   a category of one row goes without. Under a header a row's path leaves
+   the category out (a tab shows its page only); a row without one keeps
+   its whole path. results: [ { e } ] in index order -> [ { r, head, path } ] */
+function paletteLayout(results) {
+	const size = new Map();
+	for (const r of results) size.set(r.e.group, (size.get(r.e.group) || 0) + 1);
+	let prev = null;
+	return results.map(r => {
+		const g = r.e.group, headed = size.get(g) > 1;
+		const head = (headed && g !== prev) ? g : null;
+		prev = g;
+		let path = r.e.path || '';
+		if (headed && path === g) path = '';
+		else if (headed && path.startsWith(g + ' › ')) path = path.slice(g.length + 3);
+		return { r, head, path };
+	});
+}
+
 /* cells holding only addresses, counters, rates or durations get the mono stack */
 const UNITS = /(?<![A-Za-z])(?:[kKMGTP]?i?B(?:\/s)?|[kMG]?bit\/s|[kMG]?bps|dBm|dB|[kMG]?Hz|ms|us|MCS|NSS|EHT|HE|VHT|HT|pkts?|packets|bytes|min|d|h|m|s)(?![A-Za-z])/g;
 function technical(text) {
@@ -194,6 +326,26 @@ function headingKey(text) {
 function repeatsTrail(key, tag, trail) {
 	if (!key) return false;
 	return (tag === 'H2' ? trail.all : trail.page).has(key);
+}
+
+/* The crumbs as shown: one that only repeats the crumb before it
+   ("System › System", a page and its tab of the same name) takes that
+   crumb's place, with its own (deeper) link and level. */
+function mergeCrumbs(parts) {
+	const out = [];
+	for (const p of parts) {
+		if (out.length && headingKey(out[out.length - 1].title) === headingKey(p.title)) out[out.length - 1] = p;
+		else out.push(p);
+	}
+	return out;
+}
+
+/* LuCI renders its 404 with the deepest node it resolved (L.env.nodespec):
+   a category (firstchild) or a node without an action */
+function notFound(spec) {
+	if (!spec || typeof spec !== 'object') return false;
+	const type = spec.action && typeof spec.action === 'object' ? spec.action.type : null;
+	return !type || type === 'firstchild';
 }
 
 /* Does help text carry a warning? LuCI writes them as a paragraph that
@@ -328,20 +480,33 @@ function replaceTable(table, block) {
 }
 
 /* Memory: one bar. in use = total - available; cache (reclaimable) =
-   available - free; free = total - LuCI's "Used" (which is total - free). */
+   available - free; free = total - LuCI's "Used" (which is total - free).
+   A table without "Total Available" (Kwrt's luci-mod-status, #103) is read
+   its own way, below. */
 function enhanceMemory() {
 	statusSections(_('Memory')).forEach(section => {
 		const table = pendingTable(section);
 		if (!table) return;
 		const rows = barRows(table), get = l => (rows.find(r => r.label === l) || {}).pair;
 		const avail = get(_('Total Available')), used = get(_('Used')),
-		      buffered = get(_('Buffered')), cached = get(_('Cached')), swap = get(_('Swap free'));
+		      buffered = get(_('Buffered')), cached = get(_('Cached')),
+		      swapFree = get(_('Swap free')), swapUsed = get(_('Swap used'));
 		const total = (used || avail || {}).total;
 		if (!total || !used) return;
 
-		const free = Math.max(0, total - used.value);
-		let available = avail ? avail.value : free + (buffered ? buffered.value : 0) + (cached ? cached.value : 0);
-		available = Math.min(total, Math.max(available, free));
+		let free, available;
+		/* the row decides, not its value: LuCI shows "?" when it has none */
+		if (rows.some(r => r.label === _('Total Available'))) {
+			free = Math.max(0, total - used.value);
+			available = avail ? avail.value : free + (buffered ? buffered.value : 0) + (cached ? cached.value : 0);
+			available = Math.min(total, Math.max(available, free));
+		}
+		else {
+			/* Kwrt: "Used" is total - MemAvailable. MemFree isn't shown, so the
+			   cache stands for what is reclaimable and Free is an estimate. */
+			available = Math.min(total, Math.max(0, total - used.value));
+			free = Math.max(0, available - (cached ? cached.value : 0));
+		}
 		const inuse = total - available, reclaim = available - free;
 		const usedPct = pctOf(inuse, total);
 
@@ -365,14 +530,16 @@ function enhanceMemory() {
 			])
 		];
 
+		/* "Swap free" in LuCI's table, "Swap used" in Kwrt's */
+		const swap = swapFree ? { used: Math.max(0, swapFree.total - swapFree.value), total: swapFree.total }
+			: swapUsed ? { used: swapUsed.value, total: swapUsed.total } : null;
 		if (swap) {
-			const swapUsed = swap.total - swap.value;
 			children.push(E('div', { 'class': 'v-meter-rows v-meter-swap' }, E('div', { 'class': 'v-meter-row' }, [
 				E('span', { 'class': 'v-meter-label' }, [ _('Swap', 'vantage-theme') ]),
 				E('div', { 'class': 'v-meter-bar is-thin', 'role': 'img',
-				           'aria-label': '%s: %s / %s'.format(_('Swap', 'vantage-theme'), fmtBytes(swapUsed), fmtBytes(swap.total)) },
-					segment('v-seg-used', swapUsed, swap.total)),
-				E('span', { 'class': 'v-meter-val' }, [ E('b', {}, [ fmtBytes(swapUsed) ]), ' / ' + fmtBytes(swap.total) ])
+				           'aria-label': '%s: %s / %s'.format(_('Swap', 'vantage-theme'), fmtBytes(swap.used), fmtBytes(swap.total)) },
+					segment('v-seg-used', swap.used, swap.total)),
+				E('span', { 'class': 'v-meter-val' }, [ E('b', {}, [ fmtBytes(swap.used) ]), ' / ' + fmtBytes(swap.total) ])
 			])));
 		}
 
@@ -380,7 +547,7 @@ function enhanceMemory() {
 	});
 }
 
-/* Storage: one thin bar per mount, "used · free of total" beside it */
+/* Storage: one thin bar per mount, "used · free · total" beside it */
 function enhanceStorage() {
 	statusSections(_('Storage')).forEach(section => {
 		const table = pendingTable(section);
@@ -397,10 +564,11 @@ function enhanceStorage() {
 			return E('div', { 'class': 'v-meter-row' }, [
 				label,
 				E('div', { 'class': 'v-meter-bar is-thin', 'role': 'img',
-				           'aria-label': '%s: %s %s, %s %s'.format(r.label, fmtBytes(used), _('used'), fmtBytes(size - used), _('free')) },
+				           'aria-label': '%s: %s %s, %s %s, %s %s'.format(r.label, fmtBytes(used), _('used'), fmtBytes(size - used), _('free'), fmtBytes(size), _('total')) },
 					segment('v-seg-used' + (p >= 95 ? ' is-crit' : p >= 80 ? ' is-warn' : ''), used, size)),
 				E('span', { 'class': 'v-meter-val' }, [
-					E('b', {}, [ fmtBytes(used) ]), ' ' + _('used') + ' · ' + fmtBytes(size - used) + ' ' + _('free') + ' · ' + fmtBytes(size)
+					/* a figure and its word stay on one line */
+					E('b', {}, [ fmtBytes(used) ]), '\u00a0' + _('used') + ' · ' + fmtBytes(size - used) + '\u00a0' + _('free') + ' · ' + fmtBytes(size) + '\u00a0' + _('total')
 				])
 			]);
 		})));
@@ -700,7 +868,14 @@ return baseclass.extend({
 		if (!admin) return;
 
 		this.admin = admin;
+		/* Appearance opened before the menu came in lacks the network
+		   path's group (hasDashboard): add it now */
+		if (this.appear && this.hasDashboard() && !this.appear.querySelector('input[name="vt-backdrop"]')) {
+			this.appear.insertBefore(this.backdropGroup(), this.appearNote);
+			this.syncAppearance();
+		}
 		this.dp = (L.env.dispatchpath || []).slice();
+		this.missing = notFound(L.env.nodespec);
 
 		this.cats = ui.menu.getChildren(admin)
 			.filter(c => c.name !== 'logout')
@@ -958,18 +1133,14 @@ return baseclass.extend({
 		this.endSwitch();
 		if (fly.getAttribute('data-cat') !== cat.name || fly.hidden) {
 			fly.textContent = '';
-			const total = cat.pages.length;
 			fly.appendChild(E('div', { 'class': 'vt-fly-head' }, [
-				svg(cat.icon, 18),
-				E('span', { 'class': 'vt-fly-title', 'id': 'vt-fly-title' }, [ cat.title ]),
-				E('span', { 'class': 'vt-fly-count' }, [ '%d %s'.format(total, total === 1 ? _('page') : _('pages')) ])
+				E('span', { 'class': 'vt-fly-title', 'id': 'vt-fly-title' }, [ cat.title ])
 			]));
 			const ul = E('ul', { 'class': 'vt-fly-list', 'role': 'list' });
 			for (const p of cat.pages) {
 				const cur = this.dp[1] === cat.name && this.dp[2] === p.name;
 				const item = E('li', {}, E('a', { 'class': 'vt-fly-link', 'href': L.url('admin', cat.name, p.name), 'aria-current': cur ? 'page' : null }, [
-					E('span', {}, [ p.title ]),
-					p.subs.length ? E('span', { 'class': 'vt-fly-meta' }, [ String(p.subs.length) ]) : ''
+					E('span', {}, [ p.title ])
 				]));
 				if (p.subs.length > 1) {
 					const sub = E('ul', { 'class': 'vt-fly-sub' });
@@ -982,7 +1153,6 @@ return baseclass.extend({
 				ul.appendChild(item);
 			}
 			fly.appendChild(ul);
-			fly.appendChild(E('div', { 'class': 'vt-fly-foot' }, [ _('Press', 'vantage-theme'), ' ', E('kbd', {}, [ 'Ctrl K' ]), ' ', _('to search all pages') ]));
 			fly.setAttribute('data-cat', cat.name);
 			fly.setAttribute('role', 'region');
 			fly.setAttribute('aria-labelledby', 'vt-fly-title');
@@ -1032,11 +1202,8 @@ return baseclass.extend({
 		this.openTimer = null;
 		this.closeFlyout(false);
 		fly.textContent = '';
-		const total = page.subs.length;
 		fly.appendChild(E('div', { 'class': 'vt-fly-head' }, [
-			svg(cat.icon, 18),
-			E('span', { 'class': 'vt-fly-title', 'id': 'vt-fly-title' }, [ page.title ]),
-			E('span', { 'class': 'vt-fly-count' }, [ '%d %s'.format(total, total === 1 ? _('page') : _('pages')) ])
+			E('span', { 'class': 'vt-fly-title', 'id': 'vt-fly-title' }, [ page.title ])
 		]));
 		const ul = E('ul', { 'class': 'vt-fly-list', 'role': 'list' });
 		for (const s of page.subs)
@@ -1088,28 +1255,31 @@ return baseclass.extend({
 		for (let i = 1; i < this.dp.length && i <= 3; i++) {
 			node = node && node.children ? node.children[this.dp[i]] : null;
 			if (!node || !node.title) break;
-			parts.push({ title: _(node.title), segs: [ 'admin' ].concat(this.dp.slice(1, i + 1)) });
+			parts.push({ title: _(node.title), segs: [ 'admin' ].concat(this.dp.slice(1, i + 1)), level: i });
 		}
+		/* a 404: the crumbs lead to the category LuCI resolved, then say so */
+		if (this.missing) parts.push({ title: _('Not found'), segs: null, level: 0 });
 		if (!parts.length) return;
 
 		/* a page with page tabs: its current crumb switches between them,
 		   from the top bar, which stays in view while the tabs scroll away */
 		const cat = this.cats.find(c => c.name === this.dp[1]);
-		const page = cat && this.dp.length > 3 ? cat.pages.find(p => p.name === this.dp[2]) : null;
+		const page = cat && !this.missing && this.dp.length > 3 ? cat.pages.find(p => p.name === this.dp[2]) : null;
 		const siblings = page && page.subs.length > 1 ? page : null;
 
+		const crumbs = mergeCrumbs(parts);
 		nav.textContent = '';
-		parts.forEach((p, i) => {
-			const last = i === parts.length - 1;
+		crumbs.forEach((p, i) => {
+			const last = i === crumbs.length - 1;
 			if (i) nav.appendChild(E('span', { 'class': 'vt-crumb-sep', 'aria-hidden': 'true' }, [ '›' ]));
-			if (last && siblings && parts.length === 3) {
+			if (last && siblings && p.level === 3) {
 				/* a disclosure (aria-expanded + aria-controls): the panel is a
 				   region of links, not a menu, so no aria-haspopup */
 				const btn = E('button', {
 					'type': 'button', 'class': 'vt-crumb vt-crumb-current vt-crumb-switch', 'aria-current': 'page',
 					'aria-expanded': 'false', 'aria-controls': 'vt-flyout',
 					'title': _('Other pages in %s').format(siblings.title)
-				}, [ E('span', {}, [ p.title ]), svg('caret', 14) ]);
+				}, [ E('span', {}, [ p.title ]), svg('down', 14) ]);
 				btn.addEventListener('click', ev => {
 					if (this.switchOpen()) this.closeFlyout(true);
 					else this.openSwitch(cat, siblings, btn, ev.detail === 0);
@@ -1134,7 +1304,7 @@ return baseclass.extend({
 
 	renderTabs() {
 		const bar = document.getElementById('vt-tabs');
-		if (!bar || this.dp.length < 3) return;
+		if (!bar || this.missing || this.dp.length < 3) return;
 		const cat = this.admin.children[this.dp[1]];
 		const page = cat && cat.children ? cat.children[this.dp[2]] : null;
 		if (!page) return;
@@ -1161,16 +1331,19 @@ return baseclass.extend({
 			const key = e.segs.join('/') + '|' + e.title;
 			if (seen.has(key)) return;
 			seen.add(key);
-			e.hay = (e.path ? e.path + ' › ' : '') + e.title;
 			this.entries.push(e);
 		};
+		/* pages carry no icon: their category heads them, and only actions
+		   have one. A tab named like its page (System Log's "System Log")
+		   is that page's entry already. */
 		for (const c of this.cats) {
-			if (c.leaf) add({ title: c.title, path: '', group: c.title, segs: [ 'admin', c.name ], icon: c.icon });
+			if (c.leaf) add({ title: c.title, path: '', group: c.title, segs: [ 'admin', c.name ] });
 			for (const p of c.pages) {
-				add({ title: p.title, path: c.title, group: c.title, segs: [ 'admin', c.name, p.name ], icon: c.icon });
+				add({ title: p.title, path: c.title, group: c.title, segs: [ 'admin', c.name, p.name ] });
 				if (p.subs.length > 1)
 					for (const s of p.subs)
-						add({ title: s.title, path: c.title + ' › ' + p.title, group: c.title, segs: [ 'admin', c.name, p.name, s.name ], icon: 'page' });
+						if (headingKey(s.title) !== headingKey(p.title))
+							add({ title: s.title, path: c.title + ' › ' + p.title, group: c.title, segs: [ 'admin', c.name, p.name, s.name ] });
 			}
 		}
 	},
@@ -1184,8 +1357,13 @@ return baseclass.extend({
 		const login = this.loginPref(), names = this.loginNames();
 		for (const k of [ 'grid', 'stars', 'none' ])
 			if (k !== login) list.push({ title: '%s: %s'.format(_('Login background'), names[k]), path: _('Appearance', 'vantage-theme'), icon: 'page', run: () => this.setLoginPref(k) });
+		if (this.hasDashboard()) {
+			const bd = this.backdropPref();
+			for (const k of [ 'grid', 'stars', 'none' ])
+				if (k !== bd) list.push({ title: '%s: %s'.format(_('Network path background'), names[k]), path: _('Appearance', 'vantage-theme'), icon: 'page', run: () => this.setBackdropPref(k) });
+		}
 		list.push({ title: _('Log out'), path: _('Session'), icon: 'logout', segs: [ 'admin', 'logout' ] });
-		list.forEach(a => { a.hay = a.path + ' › ' + a.title; a.group = _('Actions'); });
+		list.forEach(a => { a.group = _('Actions'); });
 		return list;
 	},
 
@@ -1210,7 +1388,7 @@ return baseclass.extend({
 		const list = E('ul', { 'class': 'vt-pal-list', 'id': 'vt-pal-list', 'role': 'listbox', 'aria-label': _('Results', 'vantage-theme') });
 		const count = E('span', { 'class': 'vt-pal-count' });
 		const box = E('div', { 'class': 'vt-pal', 'role': 'dialog', 'aria-modal': 'true', 'aria-label': _('Command palette') }, [
-			E('div', { 'class': 'vt-pal-field' }, [ svg('search', 18), input, E('kbd', {}, [ 'Esc' ]) ]),
+			E('div', { 'class': 'vt-pal-field' }, [ svg('search', 18), input ]),
 			list,
 			E('div', { 'class': 'vt-pal-foot' }, [
 				E('span', {}, [ E('kbd', {}, [ '↑' ]), E('kbd', {}, [ '↓' ]), _('navigate') ]),
@@ -1242,35 +1420,18 @@ return baseclass.extend({
 		const pal = this.pal;
 		const q = pal.input.value.trim();
 		const pool = this.entries.concat(this.actions());
-		let results;
-
-		if (!q) {
-			results = pool.map(e => ({ e, idx: [] }));
-		}
-		else {
-			results = [];
-			for (const e of pool) {
-				const onTitle = fuzzy(q, e.title);
-				const onPath = onTitle ? null : fuzzy(q, e.hay);
-				if (onTitle) results.push({ e, score: onTitle.score + 6, idx: onTitle.idx });
-				else if (onPath) results.push({ e, score: onPath.score * .6, idx: [] });
-			}
-			results.sort((a, b) => b.score - a.score);
-			results = results.slice(0, 40);
-		}
+		const found = q ? rankPalette(q, pool) : null;
+		const results = q ? found.slice(0, 40) : pool.map(e => ({ e, idx: [] }));
+		const rows = q ? results.map(r => ({ r, head: null, path: r.e.path })) : paletteLayout(results);
 
 		pal.list.textContent = '';
 		pal.items = [];
-		let group = null;
-		results.forEach((r, n) => {
-			if (!q && r.e.group !== group) {
-				group = r.e.group;
-				pal.list.appendChild(E('li', { 'class': 'vt-pal-group', 'role': 'presentation' }, [ group ]));
-			}
+		rows.forEach(({ r, head, path }, n) => {
+			if (head) pal.list.appendChild(E('li', { 'class': 'vt-pal-group', 'role': 'presentation' }, [ head ]));
 			const li = E('li', { 'class': 'vt-pal-item', 'role': 'option', 'id': 'vt-pal-opt-' + n, 'aria-selected': 'false' }, [
-				svg(r.e.icon, 18),
+				r.e.icon ? svg(r.e.icon, 18) : '',
 				highlight(r.e.title, r.idx),
-				r.e.path ? E('span', { 'class': 'vt-pal-path' }, [ r.e.path ]) : '',
+				path ? E('span', { 'class': 'vt-pal-path' }, [ path ]) : '',
 				E('kbd', { 'class': 'vt-pal-enter' }, [ '↵' ])
 			]);
 			li.addEventListener('mousemove', () => this.setPaletteActive(n, false));
@@ -1282,7 +1443,7 @@ return baseclass.extend({
 		if (!results.length)
 			pal.list.appendChild(E('li', { 'class': 'vt-pal-empty', 'role': 'presentation' }, [ _('No matching pages') ]));
 
-		pal.count.textContent = q ? '%d / %d'.format(results.length, pool.length) : '%d %s'.format(pool.length, _('items', 'vantage-theme'));
+		pal.count.textContent = q ? N_(found.length, '%d result', '%d results', 'vantage-theme').format(found.length) : '';
 		this.setPaletteActive(0, true);
 	},
 
@@ -1312,7 +1473,7 @@ return baseclass.extend({
 			ev.preventDefault();
 			if (pal.items[pal.active]) this.runEntry(pal.items[pal.active].e);
 			break;
-		case 'Escape': ev.preventDefault(); this.closePalette(); break;
+		case 'Escape': ev.preventDefault(); ev.stopPropagation(); this.closePalette(); break;
 		case 'Tab': ev.preventDefault(); break;
 		}
 	},
@@ -1358,14 +1519,62 @@ return baseclass.extend({
 
 	/* -------------------------------------------------------- theme */
 
+	/* may this login save Appearance for every browser (header.ut): yes, relogin or no */
+	lookState() {
+		const v = this.root.getAttribute('data-vt-look-save');
+		return v === 'yes' || v === 'relogin' ? v : 'no';
+	},
+
+	/* one Appearance setting (LOOK), the value in force */
+	lookPref(name) {
+		const k = LOOK[name], mine = this.lookState() === 'yes' ? null : storageGet(k.own);
+		return lookValue(k.ok, [ (this.lookPending || {})[name], mine, this.root.getAttribute('data-vt-look-' + name), storageGet(k.before) ]);
+	},
+
+	/* Save one for every browser where this login may, else for this
+	   browser. Saves queue in order and only the latest pick of each is
+	   written; `apply` shows it at once and again when done. A save that
+	   fails leaves the pick shown on this page, with a note. */
+	setLook(name, value, apply) {
+		const k = LOOK[name];
+		const pending = this.lookPending || (this.lookPending = {});
+		const failed = this.lookFailed || (this.lookFailed = {});
+		if (k.ok.indexOf(value) < 0 || (pending[name] === value && !failed[name])) return;
+		if (this.lookState() !== 'yes') {
+			storageSet(k.own, value);
+			storageSet(k.before, value);
+			apply();
+			return;
+		}
+		const seqs = this.lookSeqs || (this.lookSeqs = {}), seq = seqs[name] = (seqs[name] || 0) + 1;
+		pending[name] = value;
+		delete failed[name];
+		apply();
+		const latest = () => seqs[name] === seq;
+		this.lookChain = (this.lookChain || Promise.resolve()).then(() => {
+			if (!latest()) return;
+			return lookWrite({ [name]: value })
+				.then(() => {
+					/* the router's value first, so other tabs never see a gap */
+					setLookAttr(this.root, name, value);
+					storageSet(LOOK_SYNC, JSON.stringify({ name: name, value: value, at: Date.now() }));
+					storageSet(k.before, value);
+					if (latest()) delete pending[name];
+				}, () => { if (latest()) failed[name] = true; });
+		}).then(apply);
+	},
+
+	/* a save that failed and wasn't done again: its pick stays shown, with a note */
+	lookFailing() {
+		return Object.keys(this.lookFailed || {}).length > 0;
+	},
+
 	themePref() {
-		const p = storageGet(THEME_KEY);
-		return (p === 'light' || p === 'dark') ? p : 'auto';
+		return this.lookPref('theme');
 	},
 
 	setTheme(pref) {
-		storageSet(THEME_KEY, pref === 'auto' ? null : pref);
-		this.applyTheme();
+		this.setLook('theme', pref, () => this.applyTheme());
 	},
 
 	applyTheme() {
@@ -1383,10 +1592,32 @@ return baseclass.extend({
 		this.syncAppearance();
 	},
 
+	/* next to the logo: nothing unless set. In the rail when it is pinned
+	   open, else first in the top bar (vantage.css); text only */
+	brandPref() {
+		return this.lookPref('brand');
+	},
+
+	setBrandPref(pref) {
+		this.setLook('brand', pref, () => this.applyBrand());
+	},
+
+	applyBrand() {
+		const v = this.brandPref(), b = this.board;
+		const name = !b ? '' : v === 'hostname' ? (host.chipNames(b.hostname, '')[0] || '') : v === 'model' ? host.productName(b) : '';
+		[ 'vt-brand-name', 'vt-top-name' ].forEach(id => {
+			const el = document.getElementById(id);
+			if (!el) return;
+			if (el.textContent !== name) el.textContent = name;
+			el.title = name;
+			el.hidden = !name;
+		});
+		this.syncAppearance();
+	},
+
 	/* the login page's backdrop (login.js): grid packets unless set */
 	loginPref() {
-		const p = storageGet(LOGIN_KEY);
-		return (p === 'stars' || p === 'none') ? p : 'grid';
+		return this.lookPref('login');
 	},
 
 	loginNames() {
@@ -1394,7 +1625,30 @@ return baseclass.extend({
 	},
 
 	setLoginPref(pref) {
-		storageSet(LOGIN_KEY, pref === 'grid' ? null : pref);
+		this.setLook('login', pref, () => this.syncAppearance());
+	},
+
+	/* Vantage's dashboard, where this user may open it: its network path
+	   takes the same backdrops as the login page */
+	hasDashboard() {
+		return !!(this.admin && ui.menu.getChildren(this.admin).some(c => c.name === 'dashboard' && c.action && c.action.path === 'vantage/overview'));
+	},
+
+	backdropPref() {
+		return this.lookPref('backdrop');
+	},
+
+	setBackdropPref(pref) {
+		this.setLook('backdrop', pref, () => this.applyBackdrop());
+	},
+
+	/* the dashboard reads the one in force from data-vt-backdrop */
+	applyBackdrop() {
+		const v = this.backdropPref();
+		if (this.root.getAttribute('data-vt-backdrop') !== v) {
+			this.root.setAttribute('data-vt-backdrop', v);
+			window.dispatchEvent(new CustomEvent(BACKDROP_EVENT));
+		}
 		this.syncAppearance();
 	},
 
@@ -1413,40 +1667,101 @@ return baseclass.extend({
 		}
 		const mq = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)');
 		if (mq && mq.addEventListener) mq.addEventListener('change', () => { if (this.themePref() === 'auto') this.applyTheme(); });
+		/* a login that may save: this browser's private picks no longer count */
+		if (this.lookState() === 'yes') Object.keys(LOOK).forEach(n => storageSet(LOOK[n].own, null));
+		/* another tab of this browser changed one, or saved one on the router */
+		const keys = [ LOOK_SYNC ];
+		Object.keys(LOOK).forEach(n => keys.push(LOOK[n].own, LOOK[n].before));
 		window.addEventListener('storage', ev => {
-			if (ev.key === THEME_KEY) this.applyTheme();
-			else if (ev.key === LOGIN_KEY) this.syncAppearance();
+			if (keys.indexOf(ev.key) < 0) return;
+			if (ev.key === LOOK_SYNC) {
+				let m = null;
+				try { m = JSON.parse(ev.newValue); } catch (e) {}
+				if (m && Object.prototype.hasOwnProperty.call(LOOK, m.name) && LOOK[m.name].ok.indexOf(m.value) >= 0) {
+					setLookAttr(this.root, m.name, m.value);
+					/* saved there: a pick that failed here is over */
+					if (this.lookPending) delete this.lookPending[m.name];
+					if (this.lookFailed) delete this.lookFailed[m.name];
+				}
+			}
+			this.applyTheme();
+			this.applyBackdrop();
+			this.applyBrand();
+		});
+		/* the dashboard's own picker (Customize), saved as Appearance's */
+		window.addEventListener(LOOK_SET_EVENT, ev => {
+			if (ev.detail && LOOK.backdrop.ok.indexOf(ev.detail) >= 0) {
+				ev.preventDefault();
+				this.setBackdropPref(ev.detail);
+			}
+		});
+		/* Customize's Done, for a login that may save; for any other it
+		   stays in that browser, which the dashboard says */
+		window.addEventListener(VIEW_SAVE_EVENT, ev => {
+			const d = ev.detail, values = {};
+			if (this.lookState() !== 'yes' || !d || !d.values || typeof d.done !== 'function') return;
+			Object.keys(d.values).forEach(n => { if (viewValue(n, d.values[n])) values[n] = d.values[n]; });
+			if (!Object.keys(values).length) return;
+			ev.preventDefault();
+			this.lookChain = (this.lookChain || Promise.resolve()).then(() => lookWrite(values))
+				.then(() => d.done(true), () => d.done(false)).catch(() => {});
 		});
 		this.applyTheme();
+		this.applyBackdrop();
+		this.applyBrand();
 	},
 
-	/* Appearance, under the colour-theme button: the colour theme and the
-	   login background, each a native radio group (the arrow keys move
+	/* Appearance, under the colour-theme button: the colour theme, the
+	   login background and, with the dashboard, the network path's
+	   background, each a native radio group (the arrow keys move
 	   within it) drawn as segments. Choices apply at once and stay open;
 	   Escape, Tab out of either end, a click outside, resizing or
 	   scrolling the page close it. */
-	appearanceEl() {
-		if (this.appear) return this.appear;
-		const group = (name, legend, opts, set) => E('fieldset', { 'class': 'vt-appear-set' }, [
+	/* one of Appearance's radio groups */
+	appearGroup(name, legend, opts, set) {
+		const look = { 'vt-colour': 'theme', 'vt-logo-name': 'brand', 'vt-login': 'login', 'vt-backdrop': 'backdrop' }[name];
+		return E('fieldset', { 'class': 'vt-appear-set' }, [
 			E('legend', {}, [ legend ]),
 			E('div', { 'class': 'vt-appear-track' }, opts.map(o => {
 				const input = E('input', { 'type': 'radio', 'name': name, 'value': o[0] });
 				input.addEventListener('change', () => { if (input.checked) set(o[0]); });
+				/* the checked option fires no change: after a failed save, this is the retry */
+				input.addEventListener('click', () => { if (input.checked && (this.lookFailed || {})[look]) set(o[0]); });
 				return E('label', { 'class': 'vt-appear-opt' }, [ input ].concat(o[2] ? [ svg(o[2], 16) ] : [], [ E('span', {}, [ o[1] ]) ]));
 			}))
 		]);
+	},
+
+	/* the network path's group, once the menu says the dashboard is here */
+	backdropGroup() {
+		const n = this.loginNames();
+		return this.appearGroup('vt-backdrop', _('Network path background'), [ [ 'grid', n.grid ], [ 'stars', n.stars ], [ 'none', n.none ] ], v => this.setBackdropPref(v));
+	},
+
+	appearanceEl() {
+		if (this.appear) return this.appear;
+		const group = (name, legend, opts, set) => this.appearGroup(name, legend, opts, set);
 		const login = this.loginNames();
 		const box = E('div', { 'id': 'vt-appearance', 'class': 'vt-appearance', 'role': 'dialog', 'aria-label': _('Appearance', 'vantage-theme'), 'hidden': 'hidden' }, [
 			group('vt-colour', _('Colour theme'), [
 				[ 'auto', _('Auto', 'vantage-theme'), 'auto' ], [ 'light', _('Light', 'vantage-theme'), 'sun' ], [ 'dark', _('Dark', 'vantage-theme'), 'moon' ]
 			], v => this.setTheme(v)),
+			group('vt-logo-name', _('Next to the logo'), [
+				[ 'none', _('Logo only') ], [ 'hostname', _('Hostname') ], [ 'model', _('Model') ]
+			], v => this.setBrandPref(v)),
 			group('vt-login', _('Login background'), [ [ 'grid', login.grid ], [ 'stars', login.stars ], [ 'none', login.none ] ], v => this.setLoginPref(v))
-		]);
+		].concat(this.hasDashboard() ? [ this.backdropGroup() ] : [], [
+			/* where the picks are kept, when not for every browser (syncAppearance) */
+			(this.appearNote = E('p', { 'class': 'vt-appear-note', 'role': 'status', 'hidden': 'hidden' })),
+			this.versionEl()
+		]));
 		box.addEventListener('keydown', ev => {
 			if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); this.closeAppearance(true); }
 			else if (ev.key === 'Tab') {
 				const sets = box.querySelectorAll('fieldset');
-				const edge = ev.shiftKey ? sets[0] : sets[sets.length - 1];
+				/* forward, the panel ends at the update check's link when it has one */
+				const last = Array.prototype.slice.call(box.querySelectorAll('.vt-appear-ver button, .vt-appear-ver a[href]')).pop();
+				const edge = ev.shiftKey ? sets[0] : (last || sets[sets.length - 1]);
 				if (edge.contains(ev.target)) { ev.preventDefault(); this.closeAppearance(true); }
 			}
 		});
@@ -1463,10 +1778,60 @@ return baseclass.extend({
 		return (this.appear = box);
 	},
 
+	/* "Vantage 1.0.16 · Check for updates", and what the check found */
+	versionEl() {
+		const btn = E('button', { 'type': 'button', 'class': 'vt-appear-check' }, [ _('Check for updates') ]);
+		const out = E('span', { 'class': 'vt-appear-update', 'role': 'status', 'hidden': 'hidden' });
+		btn.addEventListener('click', () => this.checkUpdates(btn, out));
+		return E('p', { 'class': 'vt-appear-ver' }, [ E('span', { 'class': 'vt-appear-num' }, [ 'Vantage ' + VERSION ]), ' · ', btn, out ]);
+	},
+
+	releaseLink(label) {
+		return E('a', { 'href': 'https://github.com/Demogorgon314/luci-theme-vantage/releases/latest', 'target': '_blank', 'rel': 'noopener noreferrer' }, [ label ]);
+	},
+
+	checkUpdates(btn, out) {
+		/* aria-disabled, not disabled: a disabled button drops the focus,
+		   and with it the panel's keys */
+		if (btn.getAttribute('aria-disabled') === 'true') return;
+		btn.setAttribute('aria-disabled', 'true');
+		out.textContent = _('Checking…');
+		out.hidden = false;
+		const ctl = window.AbortController ? new AbortController() : null;
+		const timer = ctl ? setTimeout(() => ctl.abort(), 10000) : 0;
+		fetch(UPDATE_INDEX, { cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', signal: ctl ? ctl.signal : undefined })
+			.then(r => r.ok ? r.text() : Promise.reject(new Error('HTTP ' + r.status)))
+			.then(text => {
+				const latest = listedVersion(text);
+				if (!latest) throw new Error('no version');
+				out.textContent = '';
+				if (newerVersion(versionParts(latest), versionParts(VERSION))) {
+					out.appendChild(document.createTextNode(_('Version %s is available.').format(latest) + ' '));
+					out.appendChild(this.releaseLink(_('What\'s new')));
+				}
+				else out.textContent = _('Up to date');
+			})
+			/* offline, or a router whose pages forbid the request (a
+			   Content-Security-Policy): the release page still opens */
+			.catch(() => {
+				out.textContent = _('Could not check for updates.') + ' ';
+				out.appendChild(this.releaseLink(_('See the latest release')));
+			})
+			.then(() => { clearTimeout(timer); btn.removeAttribute('aria-disabled'); });
+	},
+
 	syncAppearance() {
 		if (!this.appear) return;
-		const now = { 'vt-colour': this.themePref(), 'vt-login': this.loginPref() };
+		const now = { 'vt-colour': this.themePref(), 'vt-logo-name': this.brandPref(), 'vt-login': this.loginPref(), 'vt-backdrop': this.backdropPref() };
 		Array.prototype.forEach.call(this.appear.querySelectorAll('input[type="radio"]'), r => { r.checked = (now[r.name] === r.value); });
+		const state = this.lookState();
+		const note = state === 'relogin' ? _('Log in again to save Appearance for every browser.')
+			: state !== 'yes' ? _('Saved in this browser only.')
+			: this.lookFailing() ? _('Could not save this for every browser. Try again.') : '';
+		if (this.appearNote) {
+			if (this.appearNote.textContent !== note) this.appearNote.textContent = note;
+			this.appearNote.hidden = !note;
+		}
 	},
 
 	openAppearance(btn) {
@@ -1508,16 +1873,17 @@ return baseclass.extend({
 			if (!board || !board.hostname) return;
 			const product = host.productName(board);
 			this.hostname = board.hostname;
+			this.board = board;
 			this.updateTitle();
+			this.applyBrand();
 			if (!chip) return;
 			chip.textContent = '';
 			/* device strings go in as text nodes (E() would parse a string as HTML) */
 			const text = v => [ document.createTextNode(String(v)) ];
-			chip.appendChild(E('b', {}, text(board.hostname)));
-			if (product) {
-				chip.appendChild(E('span', { 'class': 'vt-host-sep', 'aria-hidden': 'true' }, text('·')));
-				chip.appendChild(E('span', {}, text(product)));
-			}
+			host.chipNames(board.hostname, product).forEach((name, i) => {
+				if (i) chip.appendChild(E('span', { 'class': 'vt-host-sep', 'aria-hidden': 'true' }, text('·')));
+				chip.appendChild(i ? E('span', {}, text(name)) : E('b', {}, text(name)));
+			});
 			const rel = board.release && board.release.description;
 			chip.setAttribute('title', [ board.hostname, product, rel ].filter(Boolean).join('\n'));
 			chip.hidden = false;
@@ -1909,12 +2275,8 @@ return baseclass.extend({
 
 	/* (i) shows, and the text folds to a line, while the text needs more
 	   than one line. Text that is not displayed (another tab, an unmet
-	   dependency) measures 0 and waits for the next resize notification. */
-	fitHelp(desc) {
-		this.fitHelps([ desc ]);
-	},
-
-	/* all sizes are read before any button changes: a write between two
+	   dependency) measures 0 and waits for the next resize notification.
+	   All sizes are read before any button changes: a write between two
 	   reads forced a layout per field (66 when the Wireless modal opened).
 	   Folded, the text still measures its full height. The line's end is
 	   set as data-v-end ("cut" at --vt-cut, or "fade"), which the CSS reads. */

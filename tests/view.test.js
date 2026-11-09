@@ -10,6 +10,10 @@ const path = require('path');
 const { load, RES } = require('./luci-stub');
 
 const REPLIES = {};
+/* the view's `ui`: tests set ui.menu */
+const UI = {};
+/* LuCI's poll: tests pause it */
+const POLL = { on: true, active() { return this.on; } };
 
 function loadView() {
 	const src = fs.readFileSync(path.join(RES, 'view/vantage/overview.js'), 'utf8');
@@ -17,7 +21,7 @@ function loadView() {
 		view: { extend: p => p },
 		/* replies come from REPLIES['object method'](...args) when set */
 		rpc: { declare: o => function(...args) { const f = REPLIES[o.object + ' ' + o.method]; return f ? f(...args) : Promise.resolve(null); } },
-		poll: {}, ui: {}, dom: {}
+		poll: POLL, ui: UI, dom: {}
 	};
 	const params = [], values = [];
 	for (const m of src.matchAll(/^'require ([\w.-]+)(?: as (\w+))?';$/gm)) {
@@ -31,24 +35,34 @@ const view = loadView();
 
 test('storage: polling and a later name refresh keep mount capacities without legacy info fields', async () => {
 	const saved = { L: global.L, window: global.window };
-	global.L = { resolveDefault: (promise, fallback) => Promise.resolve(promise).catch(() => fallback) };
+	global.L = { env: { sessionid: 'storage-test-login' }, resolveDefault: (promise, fallback) => Promise.resolve(promise).catch(() => fallback) };
 	global.window = { sessionStorage: { getItem: () => null, setItem() {} }, localStorage: { getItem: () => null } };
 	const mounts = [ { mount: '/overlay', size: 100000, free: 40000, avail: 35000 }, { mount: '/tmp', size: 200000, free: 180000 } ];
+	const routes = [ { family: 4, dev: 'wan', metric: 0 } ];
 	REPLIES['luci getMountPoints'] = () => Promise.resolve(mounts);
+	REPLIES['luci.vantage routes'] = () => Promise.resolve({ routes });
 	try {
 		const self = Object.create(view);
 		self.initState({ board: {}, canWrite: false, canRdns: false, mdns: null });
 		self.resolveMore = () => {};
 		self.paint = () => {};
 		const raw = await self.fetch();
+		assert.deepEqual(raw.routes, routes, 'kernel routes and mount points use independent reply slots');
+		assert.deepEqual(raw.mounts, mounts);
 		self.ingest(raw);
 		assert.deepEqual(self.m.device.storage.map(s => [ s.total, s.used ]), [ [ 100000, 60000 ], [ 200000, 20000 ] ]);
 		self.rerender();
 		assert.equal(self.m.device.storage.length, 2, 'renaming a client must not discard the storage data');
 		REPLIES['luci getMountPoints'] = () => Promise.reject(new Error('Method unavailable'));
 		assert.deepEqual((await self.fetch()).mounts, [], 'an unavailable optional method does not fail the whole poll');
+		REPLIES['luci.vantage routes'] = () => Promise.resolve({ routes: null });
+		REPLIES['luci getMountPoints'] = () => Promise.resolve(mounts);
+		const fallback = await Object.create(view).fetch();
+		assert.equal(fallback.routes, null, 'legacy libnl leaves routing decisions to netifd');
+		assert.deepEqual(fallback.mounts, mounts, 'route lookup degradation leaves storage intact');
 	} finally {
 		delete REPLIES['luci getMountPoints'];
+		delete REPLIES['luci.vantage routes'];
 		global.L = saved.L;
 		global.window = saved.window;
 	}
@@ -78,7 +92,8 @@ test('deep links: a station MAC or a known radio opens its drawer', () => {
 	assert.deepEqual(openFor('#client=00-00-5E-00-53-21').opened, [ [ 'client', '00:00:5e:00:53:21' ] ]);
 	assert.deepEqual(openFor('#client=00%3A00%3A5e%3A00%3A53%3A21').opened, [ [ 'client', '00:00:5e:00:53:21' ] ]);
 	assert.deepEqual(openFor('#radio=radio1').opened, [ [ 'radio', 'radio1' ] ]);
-	assert.deepEqual(openFor('#uplink=anything').opened, [ [ 'uplink', 'uplink' ] ], 'uplink takes no id');
+	assert.deepEqual(openFor('#uplink=anything').opened, [ [ 'uplink', '' ] ], 'a name the device has no line of: the main line');
+	assert.deepEqual(openFor('#uplink').opened, [ [ 'uplink', '' ] ], 'the main line, whichever it is');
 	assert.deepEqual(openFor('#device=%3Cb%3E').opened, [ [ 'device', 'device' ] ], 'device takes no id');
 });
 
@@ -96,6 +111,8 @@ test('deep links: arbitrary text, unknown radios and bad escapes are dropped, no
 });
 
 test('stored history: keys from sessionStorage cannot replace a prototype', () => {
+	const savedL = global.L;
+	global.L = { env: {} };
 	const stored = JSON.stringify({ net: JSON.parse('{"__proto__":[[1,2,3]],"constructor":[[1,2,3]],"radio0":[[1,2,3]]}'), clients: {} });
 	const saved = global.window;
 	global.window = {
@@ -114,6 +131,7 @@ test('stored history: keys from sessionStorage cannot replace a prototype', () =
 			assert.equal(Object.getPrototypeOf(self.st[k]), null, k);
 	} finally {
 		global.window = saved;
+		global.L = savedL;
 	}
 });
 
@@ -203,8 +221,11 @@ test('wired hosts: the path counts those downstream only; filters, search and so
 	self.ui = { kind: 'wired', chip: 'all', filter: '' };
 
 	assert.deepEqual(self.wiredPorts(), [ 'lan1', 'lan2' ], 'the uplink\'s port leads to the gateway');
-	const kpi = self.kpiSpecs()[0];
-	assert.deepEqual([ kpi.value, kpi.sub ], [ '3', '3 wired' ]);
+	/* the path's Wired branch: a node per downstream port, their hosts counted */
+	const stub = () => ({ textContent: '', getAttribute() { return null; }, setAttribute() {} });
+	const branch = { ssids: self.wiredPorts().map(port => ({ port, el: stub(), name: stub(), count: stub(), rate: stub() })), title: stub(), sub: stub() };
+	self.updateWiredBranch(branch);
+	assert.equal(branch.title.textContent, '3 devices');
 	/* a bridge with several ports, the gateway's port unknown: the
 	   counters' port is a guess, so only the gateway is left out */
 	self.m.uplink = { dev: 'lan1', statsDev: 'lan1', port: null };
@@ -269,7 +290,8 @@ test('wired branch: each port node shows its traffic, all its hosts\' together',
 	const b = { ssids: [ node('lan5'), node('lan6') ], title: el(), sub: el() };
 	self.updateWiredBranch(b);
 	const [ shared, alone ] = b.ssids;
-	assert.deepEqual([ shared.name.textContent, shared.count.textContent, shared.rate.textContent ], [ 'lan5', '2 devices', '↓ 12M  ↑ 3k' ]);
+	/* full units: each its own where they differ */
+	assert.deepEqual([ shared.name.textContent, shared.count.textContent, shared.rate.textContent ], [ 'lan5', '2 devices', '↓ 12.3 Mbit/s  ↑ 3 kbit/s' ]);
 	assert.equal(shared.el.attrs.title, 'Show the devices on lan5\nPort total: ↓ 12.3 Mbit/s · ↑ 3 kbit/s');
 	assert.deepEqual([ alone.name.textContent, alone.rate.textContent, alone.el.attrs.title ], [ 'lan6 · h03', '—', 'Show the devices on lan6' ], 'no counters yet: a dash, no total');
 	assert.equal(b.sub.textContent, '↓ 12.3 Mbit/s');
@@ -373,4 +395,498 @@ test('switch ports: LuCI is asked on the side for a switch with hosts behind it,
 		delete REPLIES['luci getSwconfigPortState'];
 		delete REPLIES['system info'];
 	}
+});
+
+/* #83: with the Vantage theme installed but another one selected, the
+   dashboard makes way for LuCI's own landing page. The dashboard alone
+   (no theme package) works under any theme. */
+test('another theme: the dashboard steps aside only when the Vantage theme is installed', () => {
+	const DASH = [ 'admin', 'status', 'dashboard' ], OVERVIEW = [ 'admin', 'status', 'overview' ];
+	/* Vantage is the theme in use */
+	assert.equal(view.asidePage('/luci-static/vantage', true, true, true), null);
+	assert.equal(view.asidePage('/luci-static/vantage/', true, false, true), null, 'a trailing slash');
+	/* another theme, Vantage's installed: LuCI's dashboard, else Status -> Overview */
+	assert.deepEqual(view.asidePage('/luci-static/argon', true, true, true), DASH);
+	assert.deepEqual(view.asidePage('/luci-static/argon', true, true, false), DASH);
+	assert.deepEqual(view.asidePage('/luci-static/argon', true, false, true), OVERVIEW);
+	assert.deepEqual(view.asidePage('/luci-static/bootstrap-dark', true, false, true), OVERVIEW);
+	assert.deepEqual(view.asidePage('/luci-static/vantage-old', true, false, true), OVERVIEW, 'another name is another theme');
+	/* neither page for this user: the dashboard, not an access error */
+	assert.equal(view.asidePage('/luci-static/argon', true, false, false), null);
+	/* the dashboard only: stays under any theme */
+	assert.equal(view.asidePage('/luci-static/argon', false, true, true), null);
+	assert.equal(view.asidePage('/luci-static/bootstrap', false, false, true), null);
+	assert.equal(view.asidePage('/luci-static/argon', 'yes', true, true), null, 'only a yes from the probe counts');
+	/* LuCI named no theme: no decision, as before */
+	for (const media of [ undefined, null, '', '/', 42 ])
+		assert.equal(view.asidePage(media, true, true, true), null, String(media));
+	const a = view.asidePage('/luci-static/argon', true, true, true);
+	a.push('x');
+	assert.deepEqual(view.asidePage('/luci-static/argon', true, true, true), DASH, 'a fresh path each time');
+});
+
+const node = (satisfied, children) => Object.assign({ satisfied }, children ? { children } : {});
+const menuWith = (dashboard, overview = node(true)) => ({ children: { admin: node(true, { status: node(true, Object.assign({ overview }, dashboard ? { dashboard } : {})) }) } });
+const SCRIPT = { ok: true, status: 200, headers: { get: h => /^content-type$/i.test(h) ? 'application/javascript; charset=UTF-8' : null } };
+const NOT_FOUND = { ok: false, status: 404, headers: { get: h => /^content-type$/i.test(h) ? 'text/html' : null } };
+const HTML_200 = { ok: true, status: 200, headers: { get: h => /^content-type$/i.test(h) ? 'text/html; charset=UTF-8' : null } };
+
+/* load() with media as L.env.media; theme: the reply to the theme probe
+   (an object, or an Error to reject); menu: the menu tree, or null for a
+   failed load. 'dashboard' when load() resolved, 'waiting' when it is
+   still pending (it never resolves after location.replace) */
+async function openDashboard(media, theme, menu) {
+	const replaced = [], probes = [], asked = [];
+	const saved = { L: global.L, fetch: global.fetch, window: global.window, menu: UI.menu };
+	global.L = {
+		env: { media, resource_version: '25.12-1' },
+		resource: p => '/luci-static/resources/' + p,
+		url: (...a) => '/cgi-bin/luci/' + a.join('/'),
+		resolveDefault: (p, d) => Promise.resolve(p).catch(() => d)
+	};
+	global.fetch = (url, opts) => {
+		if (url !== '/luci-static/resources/menu-vantage.js') return Promise.resolve({ ok: false, text: () => Promise.resolve('') });
+		probes.push((opts && opts.method) || 'GET');
+		return theme instanceof Error ? Promise.reject(theme) : Promise.resolve(theme);
+	};
+	global.window = { location: { replace: url => replaced.push(url) } };
+	UI.menu = { load: () => menu ? Promise.resolve(menu) : Promise.reject(new Error('menu failed')) };
+	REPLIES['system board'] = () => { asked.push('board'); return Promise.resolve({}); };
+	try {
+		const out = await Promise.race([ Object.create(view).load().then(() => 'dashboard'), new Promise(r => setTimeout(() => r('waiting'), 100)) ]);
+		return { out, replaced, probes, asked };
+	} finally {
+		global.L = saved.L;
+		global.fetch = saved.fetch;
+		if (saved.window === undefined) delete global.window; else global.window = saved.window;
+		UI.menu = saved.menu;
+		delete REPLIES['system board'];
+	}
+}
+
+test('another theme: load() decides before the dashboard asks for anything', async () => {
+	const stays = { out: 'dashboard', replaced: [], asked: [ 'board' ] };
+	const pick = r => ({ out: r.out, replaced: r.replaced, asked: r.asked });
+
+	/* Vantage in use: no probe at all */
+	let r = await openDashboard('/luci-static/vantage', SCRIPT, menuWith(node(true)));
+	assert.deepEqual(pick(r), stays);
+	assert.deepEqual(r.probes, [], 'nothing asked under Vantage');
+
+	/* another theme with Vantage's installed: replaced, nothing of the dashboard loaded */
+	r = await openDashboard('/luci-static/argon', SCRIPT, menuWith(node(true)));
+	assert.deepEqual(pick(r), { out: 'waiting', replaced: [ '/cgi-bin/luci/admin/status/dashboard' ], asked: [] });
+	assert.deepEqual(r.probes, [ 'HEAD' ]);
+	r = await openDashboard('/luci-static/argon', SCRIPT, menuWith(null));
+	assert.deepEqual(pick(r), { out: 'waiting', replaced: [ '/cgi-bin/luci/admin/status/overview' ], asked: [] }, 'no luci-mod-dashboard');
+	r = await openDashboard('/luci-static/argon', SCRIPT, menuWith(node(false)));
+	assert.deepEqual(r.replaced, [ '/cgi-bin/luci/admin/status/overview' ], 'luci-mod-dashboard, but not for this user');
+	r = await openDashboard('/luci-static/argon', SCRIPT, null);
+	assert.deepEqual(r.replaced, [ '/cgi-bin/luci/admin/status/overview' ], 'no menu: the page every LuCI has');
+	assert.deepEqual(pick(await openDashboard('/luci-static/argon', SCRIPT, menuWith(null, node(false)))), stays, 'a user without Status -> Overview');
+
+	/* the dashboard only, or no clear answer: the dashboard, as before */
+	assert.deepEqual(pick(await openDashboard('/luci-static/argon', NOT_FOUND, menuWith(node(true)))), stays, '404');
+	assert.deepEqual(pick(await openDashboard('/luci-static/bootstrap', HTML_200, menuWith(node(true)))), stays, 'an error page with 200');
+	assert.deepEqual(pick(await openDashboard('/luci-static/argon', new TypeError('Failed to fetch'), menuWith(node(true)))), stays, 'no answer');
+	r = await openDashboard(undefined, SCRIPT, menuWith(node(true)));
+	assert.deepEqual([ pick(r), r.probes ], [ stays, [] ], 'no media');
+});
+
+test('another theme: the probed file is the theme package\'s alone, the target the app\'s menu entry', () => {
+	const ROOT = path.join(__dirname, '..');
+	const src = fs.readFileSync(path.join(RES, 'view/vantage/overview.js'), 'utf8');
+	assert.match(src, /fetch\(L\.resource\('menu-vantage\.js'\)/);
+	assert.ok(fs.existsSync(path.join(ROOT, 'luci-theme-vantage/htdocs/luci-static/resources/menu-vantage.js')), 'luci-theme-vantage ships it');
+	assert.ok(!fs.existsSync(path.join(RES, 'menu-vantage.js')), 'luci-app-vantage must not');
+	const menu = JSON.parse(fs.readFileSync(path.join(ROOT, 'luci-app-vantage/root/usr/share/luci/menu.d/zz-luci-app-vantage.json'), 'utf8'));
+	assert.match(src, /var LUCI_DASHBOARD = \[ 'admin', 'status', 'dashboard' \];/);
+	assert.equal(menu['admin/status/dashboard'].action.path, 'dashboard/index', 'luci-mod-dashboard\'s page');
+	assert.equal(menu['admin/dashboard'].action.path, 'vantage/overview');
+});
+
+test('header: model and hostname once each, one of them when it holds the other', () => {
+	const id = d => view.identity(d);
+	assert.deepEqual(id({ model: 'Example AX3000', hostname: 'example-ax3000' }), [ 'Example AX3000' ]);
+	assert.deepEqual(id({ model: 'Example AX3000', hostname: 'AX3000' }), [ 'Example AX3000' ], 'the model holds the hostname');
+	assert.deepEqual(id({ model: 'AX3000', hostname: 'ax3000-attic' }), [ 'ax3000-attic' ], 'the hostname holds the model');
+	assert.deepEqual(id({ model: 'Example AX3000', hostname: 'attic' }), [ 'Example AX3000', 'attic' ]);
+	assert.deepEqual(id({ model: 'Example AX3000', hostname: null }), [ 'Example AX3000' ]);
+	assert.deepEqual(id({ model: 'Example AX3000', hostname: '--' }), [ 'Example AX3000', '--' ], 'nothing to compare: both');
+});
+
+test('health: the theme\'s refresh dot hears a warning or an error, nothing else', () => {
+	const saved = global.document;
+	const root = { attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } };
+	global.document = { documentElement: root };
+	try {
+		for (const [ level, want ] of [ [ 'ok', '' ], [ 'warn', 'warn' ], [ 'err', 'err' ], [ 'unknown', '' ], [ 'info', '' ] ]) {
+			const self = Object.create(view);
+			self.st = { summary: { level, headline: 'x' } };
+			self.m = { clients: [], device: {}, wired: false };
+			self.el = { orb: {}, headline: { textContent: '' }, subline: { textContent: '' } };
+			self.identity = () => [];
+			self.paintHead();
+			assert.equal(self.el.orb.className, 'vt-orb vt-orb-' + level);
+			assert.equal(root.attrs['data-vt-alert'], want, level);
+		}
+	} finally {
+		if (saved === undefined) delete global.document; else global.document = saved;
+	}
+});
+
+test('live pill: under the Vantage theme only when not live; under another theme always', () => {
+	const saved = { L: global.L, document: global.document };
+	const pill = () => ({ className: '', hidden: false, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } });
+	const root = { attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } };
+	const run = (media, st) => {
+		global.L = { env: { media } };
+		global.document = { hidden: false, documentElement: root };
+		const self = Object.create(view);
+		self.st = Object.assign({ paused: false, lastErr: null, lastOk: Date.now() }, st);
+		self.el = { live: pill(), liveText: { textContent: '' } };
+		self.paintLive();
+		return [ self.el.live.hidden, self.el.live.className ];
+	};
+	try {
+		assert.deepEqual(run('/luci-static/vantage', {}), [ true, 'vt-livepill vt-live-ok' ], 'the theme\'s poll indicator says it');
+		assert.deepEqual(run('/luci-static/vantage', { lastErr: new Error('x') }), [ false, 'vt-livepill vt-live-err' ]);
+		assert.equal(root.attrs['data-vt-live'], 'err', 'the theme\'s refresh dot hears it');
+		assert.deepEqual(run('/luci-static/vantage/', { paused: true }), [ false, 'vt-livepill vt-live-paused' ]);
+		assert.deepEqual(run('/luci-static/bootstrap', {}), [ false, 'vt-livepill vt-live-ok' ]);
+	} finally {
+		global.L = saved.L;
+		if (saved.document === undefined) delete global.document; else global.document = saved.document;
+	}
+});
+
+test('paused from LuCI\'s indicator: the pill says so (once, under the Vantage theme) and nothing moves', () => {
+	const saved = { L: global.L, document: global.document };
+	const root = { attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } };
+	const anim = () => ({ state: 'running', play() { this.state = 'running'; }, pause() { this.state = 'paused'; } });
+	const make = media => {
+		global.L = { env: { media } };
+		global.document = { hidden: false, documentElement: root };
+		const self = Object.create(view);
+		const cls = new Set();
+		self.st = { paused: false, lastErr: null, lastOk: Date.now() };
+		self.el = { live: { className: '', hidden: false, setAttribute() {} }, liveText: { textContent: '' },
+			root: { classList: { toggle: (c, on) => on ? cls.add(c) : cls.delete(c) } } };
+		self.wireMap = { a: { anims: [ anim(), anim() ] } };
+		self.backdrop = { paused: false, pause(on) { this.paused = on; } };
+		self.cls = cls;
+		return self;
+	};
+	try {
+		POLL.on = false;
+		let self = make('/luci-static/vantage');
+		self.paintLive();
+		assert.equal(self.el.live.className, 'vt-livepill vt-live-paused');
+		assert.equal(self.el.live.hidden, true, 'the theme\'s indicator already says Paused');
+		assert.equal(self.el.liveText.textContent, 'Paused');
+		assert.equal(root.attrs['data-vt-live'], 'paused');
+		assert.ok(self.cls.has('vt-still'), 'the status circle stands still');
+		assert.deepEqual(self.wireMap.a.anims.map(a => a.state), [ 'paused', 'paused' ], 'the flow dots stop where they are');
+		assert.equal(self.backdrop.paused, true, 'the backdrop keeps its last frame');
+		POLL.on = true;
+		self.paintLive();
+		assert.equal(self.el.live.className, 'vt-livepill vt-live-ok');
+		assert.ok(!self.cls.has('vt-still'));
+		assert.deepEqual(self.wireMap.a.anims.map(a => a.state), [ 'running', 'running' ], 'and go on from there');
+		assert.equal(self.backdrop.paused, false);
+		POLL.on = false;
+		self = make('/luci-static/bootstrap');
+		self.paintLive();
+		assert.deepEqual([ self.el.live.hidden, self.el.liveText.textContent ], [ false, 'Paused' ], 'another theme: the pill says it');
+	} finally {
+		POLL.on = true;
+		global.L = saved.L;
+		if (saved.document === undefined) delete global.document; else global.document = saved.document;
+	}
+});
+
+test('clients: a pick (filter, quick filter, Wi-Fi or wired) shows the new height at once; a poll keeps the hold', () => {
+	const self = Object.create(view);
+	let laid = 0;
+	self.held = { clients: { h: 6000, since: 1 }, chart: { h: 300, since: 1 } };
+	self.paintClients = () => {};
+	self.scheduleLayout = () => { laid++; };
+	self.el = { filter: { value: '' } };
+	self.ui = { kind: 'wired', chip: 'all', filter: '' };
+	self.setFilter('phone');
+	assert.equal(self.held.clients, undefined, 'released');
+	assert.ok(self.held.chart, 'other tiles keep theirs');
+	assert.equal(laid, 1);
+	self.held.clients = { h: 6000, since: 1 };
+	self.pickClients();
+	assert.equal(self.held.clients, undefined);
+	/* the Wi-Fi/Wired switch and the quick filters go through pickClients */
+	const src = fs.readFileSync(path.join(RES, 'view/vantage/overview.js'), 'utf8');
+	assert.match(src, /ui\.kind = k\[0\]; ui\.chip = 'all'; self\.pickClients\(\);/);
+	assert.match(src, /ui\.chip = d\[0\]; self\.filterMenu\(false\); self\.pickClients\(\);/);
+	assert.match(src, /'input': function\(ev\) \{ self\.ui\.filter = ev\.target\.value; self\.pickClients\(\); \}/);
+});
+
+test('deep links: moving from an open drawer to a client names the client', () => {
+	const self = Object.create(view);
+	self.ui = { drawer: { kind: 'radio', id: 'radio1' } };
+	self.el = { drawer: { hidden: false } };
+	let painted = 0;
+	self.paintDrawer = () => { painted++; };
+	self.paintClients = () => {};
+	const cleared = withLocation('#radio=radio1', c => { self.openDrawer('client', '00:00:5e:00:53:21'); return c; });
+	assert.deepEqual(cleared, [ '#client=00%3A00%3A5e%3A00%3A53%3A21' ]);
+	assert.deepEqual(self.ui.drawer, { kind: 'client', id: '00:00:5e:00:53:21' });
+	assert.equal(painted, 1);
+});
+
+/* a tree of { tag, attrs, children } from E() stubs, as text and classes */
+function withDom(fn) {
+	const saved = { E: global.E, document: global.document };
+	const node = () => ({ setAttribute() {}, appendChild() {}, style: { setProperty() {} } });
+	global.document = { createElementNS: node };
+	global.E = (tag, attrs, children) => ({ tag, attrs: attrs || {}, children: [].concat(children == null ? [] : children), style: { setProperty() {} },
+		classList: { add() {}, remove() {}, toggle() {} }, appendChild(c) { this.children.push(c); return c; } });
+	try { return fn(); }
+	finally {
+		if (saved.E === undefined) delete global.E; else global.E = saved.E;
+		if (saved.document === undefined) delete global.document; else global.document = saved.document;
+	}
+}
+const texts = n => n == null || n === '' ? [] : typeof n === 'string' ? [ n ] : n.children ? n.children.flatMap(texts) : [];
+const classes = n => n && typeof n === 'object' && n.children ? [ n.attrs && n.attrs['class'] ].concat(n.children.flatMap(classes)).filter(Boolean) : [];
+
+test('names made up from the MAC: the plain name beside the MAC, no source badge; one line keeps the octets', () => {
+	const self = Object.create(view);
+	const priv = { mac: '02:00:5e:00:53:11', macLabel: '02:00:5E:00:53:11', name: 'Private device 53:11', plainName: 'Private device',
+		nameSource: 'private', nameSourceLabel: 'Private', secondary: '02:00:5E:00:53:11', icon: 'phone' };
+	const named = Object.assign({}, priv, { name: 'phone', plainName: 'phone', nameSource: 'dhcp', nameSourceLabel: 'DHCP', secondary: '192.0.2.44' });
+	withDom(() => {
+		const row = self.whoCell(priv, []);
+		assert.deepEqual(texts(row), [ 'Private device', '02:00:5E:00:53:11' ]);
+		assert.ok(!classes(row).some(c => /vt-src/.test(c)), 'no PRIVATE badge');
+		/* an address as the second line: the octets stay to tell it apart */
+		assert.deepEqual(texts(self.whoCell(Object.assign({}, priv, { secondary: '192.0.2.50' }), [])), [ 'Private device 53:11', '192.0.2.50' ]);
+		const who = self.drawerWho(priv);
+		assert.deepEqual(texts(who[1]), [ 'Private device', '02:00:5E:00:53:11' ]);
+		/* a real name keeps its source */
+		assert.deepEqual(texts(self.whoCell(named, [])), [ 'phone', 'DHCP', '192.0.2.44' ]);
+		assert.deepEqual(texts(self.drawerWho(named)[1]), [ 'phone', 'DHCP', '192.0.2.44' ]);
+	});
+});
+
+/* other lines to the internet (#88): failover and mwan3 lines beside the main one */
+const LINE = (iface, dev, metric) => ({ iface, l3dev: dev, dev, statsDev: dev, port: dev, proto: 'dhcp', up: true, carrier: true, speed: { mbps: 1000, duplex: 'full' },
+	ipv4: [ '203.0.113.' + (metric + 2) + '/29' ], ipv6: [], gateway: '203.0.113.' + (metric + 1), defaultRoute: true, metric, dns: [], stats: { rx_bytes: 10, tx_bytes: 20 }, isWan: true, uptime: 60 });
+
+test('other lines: in the path\'s key, one chart row each, every line\'s history by its interface', () => {
+	const self = Object.create(view);
+	const wan = LINE('wan', 'eth1', 10);
+	self.m = { wired: true, networks: [ { name: 'lan', up: true } ], radios: [ { id: 'radio0', bandLabel: '5 GHz' } ], ssids: [], wiredHosts: [], uplink: wan, uplinks: [ wan ] };
+	const one = self.heroKey();
+	assert.deepEqual(self.extraLines(), []);
+	assert.deepEqual(self.chartSeries().map(s => s.key), [ 'up:wan', 'radio0' ]);
+	self.m.uplinks = [ wan, LINE('wanb', 'eth2', 20) ];
+	assert.notEqual(self.heroKey(), one, 'a line that comes or goes rebuilds the path');
+	assert.deepEqual(self.chartSeries().map(s => [ s.key, s.label, s.dn, s.up ]), [
+		[ 'up:wan', 'Uplink eth1', 1, 2 ], [ 'up:wanb', 'Uplink eth2', 1, 2 ], [ 'radio0', '5 GHz radio', 2, 1 ] ]);
+	self.m.wired = false;
+	assert.match(self.heroKey(), /lines=wanb$/);
+	/* the model caps the lines (model.MAX_LINES); no line: an empty row */
+	assert.deepEqual(self.extraLines({ uplinks: null }), []);
+	self.m.uplink = null;
+	self.m.uplinks = [];
+	assert.deepEqual(self.chartSeries().map(s => s.key), [ 'uplink', 'radio0' ]);
+});
+
+test('other lines: a deep link opens a line the device has, the main one by its name too; any other name opens the main one', () => {
+	const at = (hash, uplinks) => {
+		const self = Object.create(view);
+		self.m = { radios: [], uplinks };
+		self.opened = [];
+		self.openDrawer = function(kind, id) { this.opened.push([ kind, id ]); };
+		withLocation(hash, () => self.openFromHash());
+		return self.opened;
+	};
+	const lines = [ LINE('wan', 'eth1', 10), LINE('wanb', 'eth2', 20) ];
+	assert.deepEqual(at('#uplink=wanb', lines), [ [ 'uplink', 'wanb' ] ]);
+	assert.deepEqual(at('#uplink=wan', lines), [ [ 'uplink', 'wan' ] ], 'the main line by its own name: that interface');
+	assert.deepEqual(at('#uplink', lines), [ [ 'uplink', '' ] ]);
+	assert.deepEqual(at('#uplink=%3Cb%3Ewanb', lines), [ [ 'uplink', '' ] ]);
+	assert.deepEqual(at('#uplink=wanb', lines.slice(0, 1)), [ [ 'uplink', '' ] ], 'a line that is gone');
+	/* the main line has an id no interface can have */
+	const self = Object.create(view);
+	self.ui = {};
+	self.el = { drawer: { hidden: false } };
+	self.paintDrawer = () => {};
+	self.paintClients = () => {};
+	assert.deepEqual(withLocation('', c => { self.openDrawer('uplink', ''); self.openDrawer('uplink', 'uplink'); return c; }), [ '#uplink', '#uplink=uplink' ]);
+});
+
+test('other lines: each node shows its name, gateway and live rates, wired into the device; the main one is marked', () => {
+	const self = Object.create(view);
+	const el = () => ({ textContent: '', attrs: {}, getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }, setAttribute(k, v) { this.attrs[k] = v; } });
+	const ln = id => ({ id, el: el(), kicker: el(), title: el(), dn: el(), up: el() });
+	const wan = LINE('wan', 'eth1', 10), wanb = LINE('wanb', 'eth2', 20), lte = Object.assign(LINE('lte', 'wwan0', 30), { gateway: null, carrier: false, speed: null });
+	const h = new Proxy({ lines: [ ln('wanb'), ln('lte'), ln('gone') ], radios: [] }, { get: (t, k) => k in t ? t[k] : (t[k] = el()) });
+	self.hero = h;
+	self.m = { wired: true, networks: [], radios: [], ssids: [], wiredHosts: [], device: { model: 'Router', uptime: 1 }, uplink: wan, uplinks: [ wan, wanb, lte ] };
+	self.st = { uplinkRate: { rx: 2e6, tx: 1e5 }, devRates: { eth2: { rx: 12345678, tx: 3000 }, wwan0: { rx: 0, tx: 0 } } };
+	self.updateHero();
+	assert.equal(h.gwKicker.textContent, 'wan', 'beside other lines the main one goes by its name');
+	const [ b, l ] = h.lines;
+	assert.deepEqual([ b.kicker.textContent, b.title.textContent, b.dn.textContent, b.up.textContent ], [ 'wanb', '203.0.113.21', '↓ 12.3 Mbit/s', '↑ 3 kbit/s' ]);
+	assert.equal(b.el.attrs.title, 'wanb · eth2 · 1 Gbit/s · full duplex');
+	assert.equal(b.el.attrs['class'], 'vt-node vt-node-gw vt-node-line');
+	assert.deepEqual([ l.title.textContent, l.dn.textContent, l.up.textContent ], [ 'wwan0', 'idle', '' ], 'no gateway address: the device; nothing moving: idle');
+	assert.equal(l.el.attrs['class'], 'vt-node vt-node-gw vt-node-line vt-node-off', 'no carrier');
+	assert.deepEqual([ b.active, l.active ], [ true, false ]);
+	/* one wire per line into the device, numbered for nesting */
+	assert.deepEqual(self.wireList().filter(w => w.line != null).map(w => [ w.key, w.from === h.lines[w.line].el, w.to === h.ap, w.speed ]),
+		[ [ 'l:wanb', true, true, 2 ], [ 'l:lte', true, true, 1 ], [ 'l:gone', true, true, 1 ] ]);
+	/* one line: the gateway's own kicker */
+	h.lines = [];
+	self.m.uplinks = [ wan ];
+	self.updateHero();
+	assert.equal(h.gwKicker.textContent, 'Internet');
+});
+
+test('no Wi-Fi: the path has the Wired branch too, even beside a network called wired (#98)', t => {
+	const self = Object.create(view);
+	const host = (mac, port, extra) => Object.assign({ mac: '00:00:5e:00:53:' + mac, name: mac, nameSource: 'mac', port, shared: false, speed: null, gateway: false }, extra);
+	const wan = LINE('wan', 'eth1', 10);
+	const hosts = [ host('01', 'lan5'), host('02', 'lan5'), host('03', 'lan5'), host('04', 'lan6'), host('05', 'eth1', { gateway: true }) ];
+	self.m = { wired: true, networks: [ { name: 'lan', proto: 'static', dev: 'br-lan', up: true, ipv4: '192.0.2.1/24' }, { name: 'wired', dev: 'br-wired', up: true } ],
+		radios: [], ssids: [], wiredHosts: hosts, device: { model: 'Router', uptime: 1 }, uplink: wan, uplinks: [ wan ] };
+	self.st = { uplinkRate: null, devRates: { lan5: { rx: 1000, tx: 3000 }, 'br-lan': { rx: 1, tx: 2 } } };
+	const nodes = [];
+	self.el = { path: { childNodes: [], classList: { toggle() {} }, setAttribute() {}, getAttribute() { return null; }, insertBefore(c) { nodes.push(c); return c; } }, wires: {}, flows: {} };
+	const key = self.heroKey();
+	assert.match(key, /\nwired=lan5,lan6\n/);
+	const savedL = global.L;
+	global.L = { url: () => '/network' };
+	t.after(() => { if (savedL === undefined) delete global.L; else global.L = savedL; });
+	withDom(() => {
+		const bare = global.E;
+		global.E = (...args) => Object.assign(bare(...args), { getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }, setAttribute(k, v) { this.attrs[k] = v; } });
+		self.buildHeroNodes(key);
+		const h = self.hero;
+		assert.deepEqual(h.radios.map(b => b.id), [ 'lan', 'wired', ':wired' ], 'beside the networks, and not mistaken for one');
+		const b = h.radios[2];
+		assert.deepEqual(b.ssids.map(sn => sn.port), [ 'lan5', 'lan6' ]);
+		self.updateHero();
+		assert.equal(b.title.textContent, '4 devices', 'the hosts on its ports, not the gateway');
+		assert.deepEqual(b.ssids.map(sn => [ sn.name.textContent, sn.count.textContent ]), [ [ 'lan5', '3 devices' ], [ 'lan6 · 04', '—' ] ], 'one host alone on a port goes by its name');
+		assert.equal(h.radios[0].title.textContent, 'lan', 'the networks still fill in');
+		const keys = self.wireList().map(w => w.key);
+		assert.equal(new Set(keys).size, keys.length, 'one wire per key');
+		assert.ok(keys.includes('r:wired') && keys.includes('r::wired') && keys.includes('s::wired:port:lan6'));
+	});
+	/* a port that comes or goes rebuilds the path */
+	hosts.push(host('06', 'lan7'));
+	assert.notEqual(self.heroKey(), key);
+});
+
+test('other lines: the uplink drawer shows the line asked for, its rates and route metric', () => {
+	const self = Object.create(view);
+	const wan = LINE('wan', 'eth1', 10), wanb = LINE('wanb', 'eth2', 20);
+	self.m = { uplink: wan, uplinks: [ wan, wanb ] };
+	self.st = { uplinkRate: { rx: 1e6, tx: 2e6 }, devRates: { eth2: { rx: 3e6, tx: 4e6 } }, hist: { net: { uplink: [], 'up:wanb': [] } } };
+	withDom(() => {
+		const d = self.drawerUplink('wanb'), all = texts({ children: d.title.concat(d.body) });
+		assert.ok(all.includes('Uplink · wanb'));
+		assert.ok(all.includes('3 Mbit/s') && all.includes('4 Mbit/s'), 'its own rates');
+		assert.deepEqual(all.slice(all.indexOf('Route metric'), all.indexOf('Route metric') + 2), [ 'Route metric', '20' ]);
+		const main = texts({ children: [].concat(self.drawerUplink('').title, self.drawerUplink('').body) });
+		assert.ok(main.includes('Uplink · wan') && main.includes('1 Mbit/s') && main.includes('10'));
+		/* a backup named "uplink" is that backup, not the main line */
+		const named = LINE('uplink', 'eth3', 30);
+		self.m.uplinks = [ wan, named ];
+		assert.ok(texts({ children: self.drawerUplink('uplink').title }).includes('Uplink · uplink'));
+		assert.ok(texts({ children: self.drawerUplink('').title }).includes('Uplink · wan'));
+		/* failover: wanb is the main line now, its drawer still wanb's, at the fast lane's rate */
+		self.m = { uplink: wanb, uplinks: [ wanb ] };
+		const now = texts({ children: [].concat(self.drawerUplink('wanb').title, self.drawerUplink('wanb').body) });
+		assert.ok(now.includes('Uplink · wanb') && now.includes('1 Mbit/s'));
+		/* wan is down: said so under its own name, not wanb's details */
+		const gone = texts({ children: [].concat(self.drawerUplink('wan').title, self.drawerUplink('wan').body) });
+		assert.deepEqual(gone.filter(t => /Uplink|down/.test(t)), [ 'Uplink · wan', 'This line is down or has no default route now.' ]);
+		assert.ok(!gone.some(t => /wanb|eth2/.test(t)));
+		/* one line: no metric row */
+		self.m.uplinks = [ wanb ];
+		assert.ok(!texts({ children: self.drawerUplink('').body }).includes('Route metric'));
+	});
+});
+
+test('stored history: it belongs to one login', () => {
+	const savedWindow = global.window, savedL = global.L, box = {};
+	const hist = sid => JSON.stringify({ sid, cpu: [ [ 1, 2 ], [ 3, 4 ] ], clients: { '00:00:5E:00:53:01': [ [ 1, 2 ] ] } });
+	global.window = {
+		sessionStorage: { getItem: () => box.v || null, setItem(k, v) { box.v = v; } },
+		localStorage: { getItem: () => null, setItem() {} }
+	};
+	global.L = { env: { sessionid: '0123456789abcdef0123456789abcdef' } };
+	const load = () => { const self = Object.create(view); self.initState({ board: {}, canWrite: false, canRdns: false, mdns: null }); return self; };
+	const now = Date.now();
+	try {
+		box.v = hist('89abcdef').replace('[[1,2],[3,4]]', JSON.stringify([ [ now - 2000, 2 ], [ now - 1000, 4 ] ]));
+		assert.equal(load().st.hist.cpu.length, 2, 'the same login keeps its history');
+		box.v = hist('ffffffff');
+		const other = load();
+		assert.equal(other.st.hist.cpu.length, 0, 'another login starts empty');
+		assert.deepEqual(Object.keys(other.st.clientHist), []);
+	} finally {
+		global.window = savedWindow;
+		global.L = savedL;
+	}
+});
+
+test('other lines: a failover starts the new main line on its own history; a restored "uplink" of nobody is dropped', () => {
+	const saved = global.window, savedL = global.L;
+	const box = {};
+	global.L = { env: {} };
+	global.window = {
+		sessionStorage: { getItem: () => box.v || null, setItem(k, v) { box.v = v; } },
+		localStorage: { getItem: () => null, setItem() {} }
+	};
+	const wan = { interface: 'wan', up: true, proto: 'dhcp', device: 'eth1', l3_device: 'eth1', metric: 10, route: [ { target: '0.0.0.0', mask: 0, nexthop: '203.0.113.1' } ] };
+	const wanb = { ...wan, interface: 'wanb', device: 'eth2', l3_device: 'eth2', metric: 20, route: [ { target: '0.0.0.0', mask: 0, nexthop: '203.0.113.9' } ] };
+	const raw = (t, ifaces) => ({ at: t, info: { localtime: t / 1000 }, stat: '', ifaces, wifi: null, hints: {}, thermal: [], fdb: [], assoc: {}, hapd: {}, hapdStatus: {}, iwinfo: {},
+		devs: { eth1: { statistics: { rx_bytes: t * 10, tx_bytes: t } }, eth2: { statistics: { rx_bytes: t * 3, tx_bytes: t } } } });
+	try {
+		box.v = JSON.stringify({ net: { uplink: [ [ 1, 2, 3 ] ], 'up:wan': [ [ 1, 2, 3 ] ] } });
+		const self = Object.create(view);
+		self.initState({ board: {}, canWrite: false, canRdns: false, mdns: null });
+		assert.deepEqual(Object.keys(self.st.hist.net), [ 'up:wan' ], 'whose "uplink" it was is unknown');
+		self.st.hist.net['up:wan'] = [];
+		const t0 = 1.8e12;
+		for (let k = 0; k < 4; k++) self.ingest(raw(t0 + k * 5000, [ wan, wanb ]));
+		const net = self.st.hist.net;
+		assert.deepEqual([ net['up:wan'].length, net['up:wanb'].length ], [ 3, 3 ]);
+		assert.equal(net['up:wan'][2][1], 5000 * 10 * 8 / 5, 'wan\'s own rate');
+		/* wan fails: wanb is the main line and goes on in its own history */
+		for (let k = 4; k < 6; k++) self.ingest(raw(t0 + k * 5000, [ wanb ]));
+		assert.equal(self.m.uplink.iface, 'wanb');
+		assert.deepEqual([ net['up:wan'].length, net['up:wanb'].length ], [ 3, 5 ]);
+		assert.ok(net['up:wanb'].every(p => p[1] === 5000 * 3 * 8 / 5), 'wanb\'s rate only');
+		assert.deepEqual(self.chartSeries().map(s => s.key), [ 'up:wanb' ]);
+		/* gone longer than the chart shows: no history left */
+		self.ingest(raw(t0 + 6 * 5000 + 5 * 60 * 1000, [ wanb ]));
+		assert.ok(!('up:wan' in net));
+		assert.ok(!('uplink' in JSON.parse(box.v).net));
+	} finally {
+		global.window = saved;
+		global.L = savedL;
+	}
+});
+
+test('other lines: hosts on a backup line\'s port are the way to its gateway, not wired clients', () => {
+	const self = Object.create(view);
+	const wan = LINE('wan', 'eth1', 10), wanb = Object.assign(LINE('wanb', 'br-lan.20', 20), { dev: 'lan4', statsDev: 'lan4', port: 'lan4' });
+	self.m = { uplink: wan, uplinks: [ wan, wanb ], wiredHosts: [ { mac: '00:00:5e:00:53:c9', port: 'lan4' }, { mac: '00:00:5e:00:53:c1', port: 'lan1' } ] };
+	assert.deepEqual(self.wiredPorts(), [ 'lan1' ]);
+	assert.deepEqual([ self.linePort('lan4'), self.linePort('lan1'), self.linePort(null) ], [ true, false, false ]);
+	/* the backup's port unknown (the VLAN's own counters): nothing left out */
+	wanb.port = null;
+	assert.deepEqual(self.wiredPorts(), [ 'lan1', 'lan4' ]);
 });

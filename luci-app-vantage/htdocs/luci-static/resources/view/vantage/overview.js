@@ -20,12 +20,18 @@
    text nodes; no string is ever parsed as markup. */
 
 var POLL_S = 5;
+/* uplink traffic and CPU are sampled every FAST_S on their own: two
+   small reads (/proc/stat, the uplink device's counters), where the full
+   poll makes eight */
+var FAST_S = 2;
 var WINDOW_MS = 5 * 60 * 1000;        /* throughput history shown */
 var HIST_MAX = 90;
+var HIST_FAST = 160;                  /* five minutes at FAST_S, and some */
 var GONE_KEEP_MS = 5 * 60 * 1000;     /* disconnected stations stay listed */
 var TALKERS = 3;                      /* top talkers shown; the tile keeps room for all */
 var SWITCH_MS = 30 * 1000;            /* LuCI runs swconfig for each switch's link state: at most this often */
 var STORE_KEY = 'vantage.hist.v1';
+var VERSION = '1.0.17-r2';            /* this package's, as its Makefile has it (tests/version.test.js) */
 var SVGNS = 'http://www.w3.org/2000/svg';
 var HOSTAPD_OBJ = /^[A-Za-z0-9_.-]{1,64}$/;
 
@@ -35,6 +41,7 @@ var callMounts = rpc.declare({ object: 'luci', method: 'getMountPoints', expect:
 var callRead = rpc.declare({ object: 'file', method: 'read', params: [ 'path' ], expect: { data: '' } });
 var callIfDump = rpc.declare({ object: 'network.interface', method: 'dump', expect: { 'interface': [] } });
 var callDevs = rpc.declare({ object: 'network.device', method: 'status', expect: { '': {} } });
+var callDev = rpc.declare({ object: 'network.device', method: 'status', params: [ 'name' ], expect: { '': {} } });
 /* luci.vantage is the app's own rpcd ucode plugin: network.wireless status
    without keys or RADIUS secrets, and the validated alias write */
 var callWifi = rpc.declare({ object: 'luci.vantage', method: 'wireless', expect: { '': {} } });
@@ -42,6 +49,9 @@ var callThermal = rpc.declare({ object: 'luci.vantage', method: 'thermal', expec
 /* { hosts, crowded, switches }: crowded when a bridge holds too many
    entries to list; switches, the swconfig switch ports behind a port */
 var callWired = rpc.declare({ object: 'luci.vantage', method: 'wired', expect: { '': {} } });
+/* the route the kernel takes to the internet: which one it kept of two
+   with one metric; { routes: null } when it could not be asked */
+var callRoutes = rpc.declare({ object: 'luci.vantage', method: 'routes', expect: { '': {} } });
 /* LuCI's own (its switch page's): link and speed of a switch's ports, in
    result. The whole reply, and a failed call rejected: a default [] would
    read as every port down */
@@ -82,6 +92,16 @@ function reducedMotion() {
 	return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
 }
 
+/* is the page rendered by the Vantage theme (L.env.media '/luci-static/vantage')? */
+/* the media path of the Vantage theme ('/luci-static/vantage'). Not a
+   literal after `return`, and no slash-star in it: LuCI's jsmin takes
+   both for a division and a comment, and the minified view stops parsing */
+var VANTAGE_MEDIA = /(^|[/])vantage[/]*$/;
+function vantageTheme() {
+	var media = L.env.media || '';
+	return VANTAGE_MEDIA.test(media);
+}
+
 /* ------------------------------------------------------------- SVG kit */
 
 var ICONS = {
@@ -93,13 +113,14 @@ var ICONS = {
 	cpu: [ 'M7.5 6h9A1.5 1.5 0 0 1 18 7.5v9a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 16.5v-9A1.5 1.5 0 0 1 7.5 6Z', 'M10 10h4v4h-4z', 'M9.5 3v3M14.5 3v3M9.5 18v3M14.5 18v3M3 9.5h3M3 14.5h3M18 9.5h3M18 14.5h3' ],
 	memory: [ 'M4 7.5h16a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1Z', 'M7 16.5v2.5M11 16.5v2.5M15 16.5v2.5M19 16.5v2.5', 'M6.5 10.5h3v3h-3zM10.5 10.5h3v3h-3zM14.5 10.5h3v3h-3z' ],
 	disk: [ 'M4.5 6.5c0-1.4 3.4-2.5 7.5-2.5s7.5 1.1 7.5 2.5v11c0 1.4-3.4 2.5-7.5 2.5s-7.5-1.1-7.5-2.5z', 'M4.5 6.5c0 1.4 3.4 2.5 7.5 2.5s7.5-1.1 7.5-2.5', 'M4.5 12c0 1.4 3.4 2.5 7.5 2.5s7.5-1.1 7.5-2.5' ],
-	clock: [ 'M12 3.5a8.5 8.5 0 1 0 0 17a8.5 8.5 0 1 0 0-17Z', 'M12 7.5V12l3 2' ],
+	/* an Ethernet jack, front on */
+	port: [ 'M5 5.5h14a1.5 1.5 0 0 1 1.5 1.5v8a1.5 1.5 0 0 1-1.5 1.5h-3v2.5h-8V16.5H5A1.5 1.5 0 0 1 3.5 15V7A1.5 1.5 0 0 1 5 5.5Z', 'M8 9v2.5M10.67 9v2.5M13.33 9v2.5M16 9v2.5' ],
+	signal: [ 'M5 19.5v-3', 'M9.5 19.5v-6.5', 'M14 19.5v-10', 'M18.5 19.5v-14' ],
 	down: [ 'M12 5v14', 'M6.5 13.5 12 19l5.5-5.5' ],
 	up: [ 'M12 19V5', 'M6.5 10.5 12 5l5.5 5.5' ],
 	close: [ 'M6.5 6.5l11 11M17.5 6.5l-11 11' ],
 	search: [ 'M10.5 4.5a6 6 0 1 0 0 12a6 6 0 1 0 0-12Z', 'M15 15l4.5 4.5' ],
 	chevron: [ 'M9.5 6l6 6-6 6' ],
-	out: [ 'M9 15 16.5 7.5', 'M10 7.5h6.5V14', 'M13 4.5H6A1.5 1.5 0 0 0 4.5 6v12A1.5 1.5 0 0 0 6 19.5h12a1.5 1.5 0 0 0 1.5-1.5v-7' ],
 	check: [ 'M5 12.5l4.5 4.5L19 7.5' ],
 	warn: [ 'M10.3 4.6 3 17.5A2 2 0 0 0 4.7 20.5h14.6A2 2 0 0 0 21 17.5L13.7 4.6a2 2 0 0 0-3.4 0Z', 'M12 9.5v4.5', 'M12 17h.01' ],
 	err: [ 'M12 3.5a8.5 8.5 0 1 0 0 17a8.5 8.5 0 1 0 0-17Z', 'M9 9l6 6M15 9l-6 6' ],
@@ -108,7 +129,6 @@ var ICONS = {
 	lock: [ 'M6.5 11h11a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1Z', 'M8.5 11V8a3.5 3.5 0 0 1 7 0v3' ],
 	unlock: [ 'M6.5 11h11a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1Z', 'M8.5 11V8a3.5 3.5 0 0 1 6.8-1.2' ],
 	users: [ 'M9 11a3.5 3.5 0 1 0 0-7a3.5 3.5 0 1 0 0 7Z', 'M2.5 20c.8-3.4 3.3-5.5 6.5-5.5s5.7 2.1 6.5 5.5', 'M16 4.3a3.5 3.5 0 0 1 0 6.4', 'M18 14.8c1.8.8 3 2.6 3.5 5.2' ],
-	spark: [ 'M12 3.5v4M12 16.5v4M3.5 12h4M16.5 12h4M6 6l2.6 2.6M15.4 15.4 18 18M6 18l2.6-2.6M15.4 8.6 18 6' ],
 	pulse: [ 'M3 12h4l2.5-6 5 12 2.5-6H21' ],
 	phone: [ 'M8 3h8a1.5 1.5 0 0 1 1.5 1.5v15A1.5 1.5 0 0 1 16 21H8a1.5 1.5 0 0 1-1.5-1.5v-15A1.5 1.5 0 0 1 8 3Z', 'M11 18h2' ],
 	laptop: [ 'M5.5 5.5h13a1 1 0 0 1 1 1v8.5h-15V6.5a1 1 0 0 1 1-1Z', 'M2.5 18.5h19l-1.5-3.5h-16z' ],
@@ -214,7 +234,9 @@ function pos(el, xPct, yPct) {
    marker on the newest value, a faint top grid line and (opts.scale) the
    axis maximum with its unit. Before a minute of history the data is
    drawn from the right edge. opts: { min: axis floor, scale: fn(max),
-   thresh: value for a dashed reference line, threshLabel } */
+   thresh: value for a dashed reference line, threshLabel, quiet: no
+   'collecting…' note before there is a line, bare: the line and its
+   area only (no grid, baseline or end marker) } */
 function sparkline(data, cols, vmax, cls, opts) {
 	opts = opts || {};
 	var W = 100, H = 26;
@@ -222,15 +244,20 @@ function sparkline(data, cols, vmax, cls, opts) {
 	var s = svgRoot('vt-spark', '0 0 ' + W + ' ' + H);
 	s.setAttribute('preserveAspectRatio', 'none');
 	wrap.appendChild(s);
-	s.appendChild(svgPath('M0 0H' + W, 'vt-spark-grid'));
-	s.appendChild(svgPath('M0 ' + H + 'H' + W, 'vt-spark-base'));
+	if (!opts.bare) {
+		s.appendChild(svgPath('M0 0H' + W, 'vt-spark-grid'));
+		s.appendChild(svgPath('M0 ' + H + 'H' + W, 'vt-spark-base'));
+	}
 	if (!data || data.length < 2) {
 		wrap.classList.add('vt-sk-empty');
-		wrap.appendChild(E('span', { 'class': 'vt-sk-note' }, [ _('collecting…') ]));
+		if (!opts.quiet) wrap.appendChild(E('span', { 'class': 'vt-sk-note' }, [ _('collecting…') ]));
 		return wrap;
 	}
-	var t1 = data[data.length - 1][0], t0 = Math.min(data[0][0], t1 - 60000);
-	var max = vmax > 0 ? vmax : series.niceCeil(Math.max(series.max(data, cols) * 1.05, opts.min || 0));
+	/* bare (a card's edge): whatever history there is, across the width,
+	   with headroom so a steady rate doesn't run along the top */
+	var t1 = data[data.length - 1][0], t0 = opts.bare ? data[0][0] : Math.min(data[0][0], t1 - 60000);
+	var max = vmax > 0 ? vmax : opts.bare ? Math.max(series.max(data, cols) * 1.35, opts.min || 0)
+		: series.niceCeil(Math.max(series.max(data, cols) * 1.05, opts.min || 0));
 	if (opts.thresh != null) {
 		var ty = H - Math.max(0, Math.min(1, opts.thresh / max)) * H;
 		s.appendChild(svgPath('M0 ' + ty.toFixed(1) + 'H' + W, 'vt-spark-thresh'));
@@ -250,12 +277,22 @@ function sparkline(data, cols, vmax, cls, opts) {
 		s.appendChild(g);
 		if (k === 0) {
 			var last = segs.length ? segs[segs.length - 1] : null, pt = last && last[last.length - 1];
-			if (pt) wrap.appendChild(pos(E('span', { 'class': 'vt-sk-dot' }), pt[0] / W * 100, pt[1] / H * 100));
+			if (pt && !opts.bare) wrap.appendChild(pos(E('span', { 'class': 'vt-sk-dot' }), pt[0] / W * 100, pt[1] / H * 100));
 		}
 	});
 	if (opts.scale) wrap.appendChild(E('span', { 'class': 'vt-sk-max vt-tn' }, [ opts.scale(max) ]));
 	return wrap;
 }
+
+/* a thin bar filled to pct, in the warning colours at warn and err */
+function fillBar(pct, level) {
+	var f = E('span', { 'class': 'vt-bar-fill' + (level === 'err' ? ' vt-bg-err' : level === 'warn' ? ' vt-bg-warn' : '') });
+	setW(f, Math.max(+pct || 0, 0.8));
+	return E('span', { 'class': 'vt-bar vt-chip-bar' }, [ f ]);
+}
+
+/* each health check's own icon (insight.health ids) */
+var CHECK_ICONS = { uplink: 'port', cpu: 'cpu', memory: 'memory', radios: 'wifi', signal: 'signal', storage: 'disk' };
 
 /* -------------------------------------------------------------- helpers */
 
@@ -264,6 +301,12 @@ function sparkline(data, cols, vmax, cls, opts) {
 function txt(el, s) { s = (s == null ? '' : String(s)); if (el.textContent !== s) el.textContent = s; return el; }
 function setClass(el, c) { if (el.getAttribute('class') !== c) el.setAttribute('class', c); }
 function setTitle(el, v) { if (el.getAttribute('title') !== v) el.setAttribute('title', v); }
+/* the throughput history of a line to the internet, the main one too,
+   by its interface: a failover starts the new main line's own history
+   instead of continuing the old one's. ':' keeps it apart from a radio's
+   (a uci section name). */
+function lineKey(x) { return 'up:' + x.iface; }
+function histMax(key) { return key.indexOf('up:') === 0 ? HIST_FAST : HIST_MAX; }
 
 /* an element's own tag and attributes, or a text node's text */
 function nodeSig(n) {
@@ -316,6 +359,10 @@ function avatar(c, small) {
 	el.style.setProperty('--vt-h', hueOf(c.mac).toFixed(0));
 	return el;
 }
+
+/* a client named after its address (vendor, private or MAC fallback,
+   names.resolve): plainName is the name without the MAC's octets */
+function madeName(c) { return !!c.plainName && c.plainName !== c.name; }
 
 function bandBadge(band, label) {
 	return E('span', { 'class': 'vt-band vt-band-' + (band || 'x') }, [ label || wifi.bandLabel(band) ]);
@@ -379,6 +426,22 @@ function pageLink(page, label) {
 	return E('a', { 'class': 'vt-link', 'href': L.url.apply(L, page) }, [ E('span', {}, [ label ]), icon('chevron') ]);
 }
 
+/* LuCI's own landing pages: luci-mod-dashboard's, where the app's menu.d
+   file moves it, and Status -> Overview */
+var LUCI_DASHBOARD = [ 'admin', 'status', 'dashboard' ];
+var LUCI_OVERVIEW = [ 'admin', 'status', 'overview' ];
+
+/* Is luci-theme-vantage installed? A HEAD for its menu script, a static
+   file from the server this view came from: no ACL, nothing new on the
+   device. The menu.d depends can't tell: LuCI caches the menu tree and a
+   theme switch doesn't renew it. Anything but a script (a 404, an error
+   page, no answer) reads as not installed, which keeps the dashboard */
+function themeInstalled() {
+	return fetch(L.resource('menu-vantage.js'), { method: 'HEAD', cache: 'no-store' }).then(function(r) {
+		return r.ok && /javascript/i.test(r.headers.get('Content-Type') || '');
+	}).catch(function() { return false; });
+}
+
 /* axis labels: round numbers without a trailing '.0' ('15 Mbit/s') */
 function bitsLabel(v) {
 	var p = fmt.bitsParts(v);
@@ -397,8 +460,17 @@ function spanShort(ms) {
 	return s >= 60 ? _('%d min', 'vantage').format(Math.floor(s / 60)) : _('%d s', 'vantage').format(s);
 }
 
+/* the history belongs to one login: the next one in this tab starts empty,
+   under any theme. Vantage's login page also deletes it (login.js). */
+function storeOwner() {
+	return String(L.env.sessionid || '').slice(-8);
+}
+
 function readStore() {
-	try { return JSON.parse(window.sessionStorage.getItem(STORE_KEY) || 'null'); } catch (e) { return null; }
+	try {
+		var v = JSON.parse(window.sessionStorage.getItem(STORE_KEY) || 'null');
+		return v && (v.sid || '') === storeOwner() ? v : null;
+	} catch (e) { return null; }
 }
 
 function writeStore(v) {
@@ -406,16 +478,22 @@ function writeStore(v) {
 }
 
 /* Sections that fold on narrow screens; the choice is remembered per
-   browser. Defaults keep the phone page short: radios and the network
-   path start condensed. */
-var FOLD_KEY = 'vantage.fold.v1';
-var FOLD_DEFAULT = { radios: true, hero: true, ssids: false, chart: false, sys: false };
+   browser. The radios start condensed; the network path starts open
+   (since 1.0.15: v1 kept it folded, so its other
+   choices carry over without that one). */
+var FOLD_KEY = 'vantage.fold.v2';
+var FOLD_KEY_V1 = 'vantage.fold.v1';
+var FOLD_DEFAULT = { radios: true, hero: false, ssids: false, chart: false, sys: false };
 
 function readFolds() {
-	var out = Object.assign({}, FOLD_DEFAULT), v = null;
+	var out = Object.assign({}, FOLD_DEFAULT), v = null, old = false;
 	try { v = JSON.parse(window.localStorage.getItem(FOLD_KEY) || 'null'); } catch (e) { v = null; }
+	if (!v || typeof v !== 'object') {
+		try { v = JSON.parse(window.localStorage.getItem(FOLD_KEY_V1) || 'null'); } catch (e) { v = null; }
+		old = true;
+	}
 	if (v && typeof v === 'object')
-		Object.keys(FOLD_DEFAULT).forEach(function(k) { if (typeof v[k] === 'boolean') out[k] = v[k]; });
+		Object.keys(FOLD_DEFAULT).forEach(function(k) { if (typeof v[k] === 'boolean' && !(old && k === 'hero')) out[k] = v[k]; });
 	return out;
 }
 
@@ -423,8 +501,44 @@ function writeFolds(v) {
 	try { window.localStorage.setItem(FOLD_KEY, JSON.stringify(v)); } catch (e) {}
 }
 
-/* Tile layouts the viewer arranged, per screen class, in this browser;
-   vantage.layout validates whatever comes back */
+/* What the Vantage theme's template hands over (data-vt-look-*): under it
+   the router keeps the layouts and the chart style with the Appearance */
+function lookAttr(name) {
+	var root = typeof document !== 'undefined' ? document.documentElement : null;
+	return (root && root.getAttribute ? root.getAttribute(name) : null) || '';
+}
+
+function lookSaves() { return lookAttr('data-vt-look-save') === 'yes'; }
+
+/* What Customize changed and the router doesn't have yet, as the options
+   it's saved in. Kept across a failed save or a reload, so Done sends
+   this and nothing else: a browser's earlier picks stay its own until
+   someone changes them. */
+var UNSAVED_KEY = 'vantage.view.unsaved';
+
+function readUnsaved() {
+	var v = null;
+	try { v = JSON.parse(window.localStorage.getItem(UNSAVED_KEY) || 'null'); } catch (e) { v = null; }
+	return Array.isArray(v) ? v.filter(function(k) { return /^(chart|layout_(wide|mid|narrow)(_wired)?)$/.test(k); }) : [];
+}
+
+function writeUnsaved(list) {
+	try {
+		if (list.length) window.localStorage.setItem(UNSAVED_KEY, JSON.stringify(list));
+		else window.localStorage.removeItem(UNSAVED_KEY);
+	} catch (e) {}
+}
+
+/* Done hands the theme what changed; true if it took it (a login that may
+   save). Without it, or for any other login, it stays in this browser. */
+function offerView(values, done) {
+	var ev = null;
+	try { ev = new CustomEvent('vantage:view-save', { detail: { values: values, done: done }, cancelable: true }); } catch (e) { ev = null; }
+	return !!ev && typeof window.dispatchEvent === 'function' && !window.dispatchEvent(ev);
+}
+
+/* Tile layouts the viewer arranged, per screen class, this browser's copy
+   of them and the router's; vantage.layout validates whatever comes back */
 var LAYOUT_KEY = 'vantage.layout.v1';
 
 function readLayouts() {
@@ -433,44 +547,62 @@ function readLayouts() {
 	var out = Object.create(null);
 	if (v && typeof v === 'object' && !Array.isArray(v))
 		Object.keys(v).forEach(function(k) { if (/^(wide|mid|narrow)(-wired)?$/.test(k) && Array.isArray(v[k])) out[k] = v[k]; });
-	return out;
+	/* changed here and not saved yet: this browser's stands, until Done sends it */
+	var saved = layout.decode(lookAttr('data-vt-look-layout')), unsaved = readUnsaved();
+	Object.keys(saved).forEach(function(k) { if (unsaved.indexOf(layout.option(k)) >= 0) delete saved[k]; });
+	return layout.merge(out, saved, lookSaves());
 }
 
+/* a login that can't save follows the router: what is the router's isn't
+   this browser's to keep */
 function writeLayouts(v) {
+	var saved = lookSaves() ? null : layout.decode(lookAttr('data-vt-look-layout')), out = {};
+	Object.keys(v).forEach(function(k) {
+		if (!saved || !saved[k] || layout.encode(saved[k]) !== layout.encode(v[k])) out[k] = v[k];
+	});
 	try {
-		if (Object.keys(v).length) window.localStorage.setItem(LAYOUT_KEY, JSON.stringify(v));
+		if (Object.keys(out).length) window.localStorage.setItem(LAYOUT_KEY, JSON.stringify(out));
 		else window.localStorage.removeItem(LAYOUT_KEY);
 	} catch (e) {}
 }
 
 /* The throughput chart style the viewer picked (series.CHART_STYLES),
-   in this browser */
+   this browser's copy of it and the router's */
 var CHART_KEY = 'vantage.chart.v1';
 
 function readChartStyle() {
 	var v = null;
 	try { v = window.localStorage.getItem(CHART_KEY); } catch (e) { v = null; }
-	return series.CHART_STYLES.indexOf(v) >= 0 ? v : series.CHART_STYLES[0];
+	return series.chartPick(lookAttr('data-vt-look-chart'), v, lookSaves() && readUnsaved().indexOf('chart') < 0);
 }
 
 function writeChartStyle(v) {
 	try {
-		if (v === series.CHART_STYLES[0]) window.localStorage.removeItem(CHART_KEY);
+		/* the default needs no entry, unless the router has another */
+		if (v === series.CHART_STYLES[0] && !lookAttr('data-vt-look-chart')) window.localStorage.removeItem(CHART_KEY);
 		else window.localStorage.setItem(CHART_KEY, v);
 	} catch (e) {}
 }
 
-/* The network path's backdrop the viewer picked (backdrop.STYLES), in
-   this browser */
+/* The network path's backdrop the viewer picked (backdrop.STYLES). Under
+   the Vantage theme its Appearance decides (saved for every browser on
+   the router where the viewer may) and keeps the one in force in
+   data-vt-backdrop; elsewhere this browser keeps it. */
 var BACKDROP_KEY = 'vantage.backdrop.v1';
 
 function readBackdrop() {
-	var v = null;
+	var root = typeof document !== 'undefined' ? document.documentElement : null;
+	var v = root && root.getAttribute ? root.getAttribute('data-vt-backdrop') : null;
+	if (backdrop.STYLES.indexOf(v) >= 0) return v;
 	try { v = window.localStorage.getItem(BACKDROP_KEY); } catch (e) { v = null; }
 	return backdrop.STYLES.indexOf(v) >= 0 ? v : backdrop.STYLES[0];
 }
 
 function writeBackdrop(v) {
+	/* the theme takes it (and cancels the event) */
+	var ev = null;
+	try { ev = new CustomEvent('vantage:backdrop-set', { detail: v, cancelable: true }); } catch (e) { ev = null; }
+	if (ev && typeof window.dispatchEvent === 'function' && !window.dispatchEvent(ev)) return;
 	try {
 		if (v === backdrop.STYLES[0]) window.localStorage.removeItem(BACKDROP_KEY);
 		else window.localStorage.setItem(BACKDROP_KEY, v);
@@ -487,19 +619,53 @@ return view.extend({
 	/* ---------------------------------------------------------- loading */
 
 	load: function() {
-		return Promise.all([
-			loadCss(),
-			L.resolveDefault(callBoard(), {}),
-			L.resolveDefault(callAccess('access-group', 'luci-app-vantage-names', 'write'), false),
-			this.loadAliases(),
-			L.resolveDefault(callMdns(), null),
-			this.fetch(),
-			/* reverse DNS is an optional grant: without it, skip it quietly */
-			L.resolveDefault(callAccess('access-group', 'luci-app-vantage-rdns', 'read'), false),
-			L.resolveDefault(ui.menu.load(), null)
-		]).then(function(r) {
+		var self = this;
+		return this.stepAside().then(function() {
+			return Promise.all([
+				loadCss(),
+				L.resolveDefault(callBoard(), {}),
+				L.resolveDefault(callAccess('access-group', 'luci-app-vantage-names', 'write'), false),
+				self.loadAliases(),
+				L.resolveDefault(callMdns(), null),
+				self.fetch(),
+				/* reverse DNS is an optional grant: without it, skip it quietly */
+				L.resolveDefault(callAccess('access-group', 'luci-app-vantage-rdns', 'read'), false),
+				L.resolveDefault(ui.menu.load(), null)
+			]);
+		}).then(function(r) {
 			menuTree = r[7] || null;
 			return { board: r[1] || {}, canWrite: r[2] === true, mdns: r[4], raw: r[5], canRdns: r[6] === true };
+		});
+	},
+
+	/* #83: the page to open instead of the dashboard, or null to stay.
+	   media is L.env.media, the theme LuCI renders with
+	   ('/luci-static/argon'). Only when luci-theme-vantage is installed
+	   but another theme is in use: the app installed alone works under
+	   any theme. Then LuCI's own landing page, luci-mod-dashboard's or
+	   Status -> Overview; a user who may see neither keeps the dashboard
+	   rather than reach an access error */
+	asidePage: function(media, themeHere, hasLuciDashboard, hasOverview) {
+		var theme = (typeof media === 'string') ? media.replace(/\/+$/, '').replace(/^.*\//, '') : '';
+		if (!theme || theme === 'vantage' || themeHere !== true) return null;
+		if (hasLuciDashboard === true) return LUCI_DASHBOARD.slice();
+		return hasOverview === false ? null : LUCI_OVERVIEW.slice();
+	},
+
+	/* before load() asks for anything. Under Vantage (or an unnamed theme)
+	   at once; under another, once the theme's file and the menu
+	   answered. Stepping aside replaces the location and never resolves,
+	   so nothing of the dashboard renders or loads */
+	stepAside: function() {
+		var self = this, media = L.env.media;
+		if (!this.asidePage(media, true, false, true)) return Promise.resolve();
+		return Promise.all([ themeInstalled(), L.resolveDefault(ui.menu.load(), null) ]).then(function(r) {
+			/* without a menu hasPage says yes: Status -> Overview, which every LuCI has */
+			menuTree = r[1] || null;
+			var to = self.asidePage(media, r[0], !!menuTree && hasPage(LUCI_DASHBOARD), hasPage(LUCI_OVERVIEW));
+			if (!to) return;
+			window.location.replace(L.url.apply(L, to));
+			return new Promise(function() {});
 		});
 	},
 
@@ -525,6 +691,8 @@ return view.extend({
 			L.resolveDefault(callHints(), {}),
 			L.resolveDefault(callThermal(), []),
 			L.resolveDefault(callWired(), {}),
+			/* null when the call fails (an older plugin): netifd's metrics decide */
+			L.resolveDefault(callRoutes(), null),
 			L.resolveDefault(callMounts(), [])
 		]).then(function(r) {
 			var wifiDevs = (r[4] && typeof r[4] === 'object') ? r[4] : null;
@@ -576,8 +744,11 @@ return view.extend({
 				});
 				var switchState = Object.create(null);
 				Object.keys(swState).forEach(function(n) { switchState[n] = swState[n].ports; });
-				return { info: r[0] || {}, mounts: r[8] || [], stat: r[1] || '', ifaces: r[2] || [], devs: r[3] || {}, wifi: wifiDevs, hints: r[5] || {}, thermal: r[6] || [],
+				return { info: r[0] || {}, mounts: r[9] || [], stat: r[1] || '', ifaces: r[2] || [], devs: r[3] || {}, wifi: wifiDevs, hints: r[5] || {}, thermal: r[6] || [],
 					fdb: Array.isArray(wiredReply.hosts) ? wiredReply.hosts : [], fdbCrowded: wiredReply.crowded === true, switches: switches, switchState: switchState,
+					/* no answer (an older plugin, a lookup not sent, a failed call)
+					   keeps the last one: no tunnel blinking off */
+					routes: r[8] && Array.isArray(r[8].routes) ? (self.kernelRoutes = r[8].routes) : (self.kernelRoutes || null),
 					assoc: assoc, hapd: hapd, hapdStatus: hapdStatus, iwinfo: iwinfo, at: Date.now(), started: started };
 			});
 		});
@@ -591,7 +762,8 @@ return view.extend({
 		var net = Object.create(null);
 		if (stored.net && typeof stored.net === 'object')
 			Object.keys(stored.net).forEach(function(k) {
-				if (/^[A-Za-z0-9_.:-]{1,40}$/.test(k)) net[k] = series.valid(stored.net[k], 3, HIST_MAX, now, model.MAX_BPS);
+				/* 'uplink' (before #88) belongs to an interface nobody noted */
+				if (/^[A-Za-z0-9_.:-]{1,40}$/.test(k) && k !== 'uplink') net[k] = series.valid(stored.net[k], 3, histMax(k), now, model.MAX_BPS);
 			});
 		var clientHist = Object.create(null);
 		if (stored.clients && typeof stored.clients === 'object')
@@ -604,7 +776,7 @@ return view.extend({
 		this.st = {
 			clock: null, stat: null, cpu: null,
 			devPrev: null, staPrev: null, devRates: Object.create(null), staRates: Object.create(null), radioRates: Object.create(null), ssidRates: Object.create(null),
-			hist: { net: net, cpu: series.valid(stored.cpu, 2, HIST_MAX, now), mem: series.valid(stored.mem, 2, HIST_MAX, now) },
+			hist: { net: net, cpu: series.valid(stored.cpu, 2, HIST_FAST, now), mem: series.valid(stored.mem, 2, HIST_MAX, now) },
 			clientHist: clientHist, bestStd: Object.create(null),
 			presence: null, isNew: Object.create(null), gone: [],
 			rdns: Object.create(null), rdnsBusy: false, rdnsOff: !data.canRdns,
@@ -620,6 +792,13 @@ return view.extend({
 		this.layouts = readLayouts();
 		this.chartStyle = readChartStyle();
 		this.backdropStyle = readBackdrop();
+		/* picked under the theme's Appearance (menu-vantage.js), here or
+		   in another tab */
+		var self = this, follow = function() { self.showBackdrop(readBackdrop()); };
+		if (window.addEventListener) {
+			window.addEventListener('vantage:backdrop', follow);
+			window.addEventListener('storage', function(ev) { if (ev.key === BACKDROP_KEY) follow(); });
+		}
 		this.editing = false;
 		this.drag = null;
 		this.applyMdns(data.mdns);
@@ -639,12 +818,19 @@ return view.extend({
 		var now = raw.at || Date.now();
 		st.clock = model.sampleClock(st.clock, now, raw.info && raw.info.localtime);
 		var at = st.clock.at;
+		/* how far the device's timeline runs from the browser's: the fast
+		   lane stamps its samples on the same timeline (a clock step on
+		   the device moves every row of the chart together) */
+		st.skew = at - Date.now();
 
-		/* CPU */
+		/* CPU, unless the fast lane samples it (refreshFast); the times
+		   are kept either way, so a reading after the lane stops covers
+		   the last poll, not the time since the page opened */
+		var fast = this.fastLive();
 		var stat = model.parseStat(raw.stat);
 		if (stat) {
-			var cpu = model.cpuUsage(st.stat, stat);
-			if (cpu) { st.cpu = cpu; series.push(st.hist.cpu, [ at, cpu.pct ], WINDOW_MS, HIST_MAX); }
+			var cpu = fast ? null : model.cpuUsage(st.stat, stat);
+			if (cpu) { st.cpu = cpu; series.push(st.hist.cpu, [ at, cpu.pct ], WINDOW_MS, HIST_FAST); }
 			if (!st.stat || stat.all.total !== st.stat.all.total) st.stat = stat;
 		}
 		st.temps = model.temps(raw.thermal);
@@ -652,7 +838,7 @@ return view.extend({
 		var m = model.build({
 			board: this.board, info: raw.info, mounts: raw.mounts, ifaces: raw.ifaces, devs: raw.devs, wifi: raw.wifi, iwinfo: raw.iwinfo,
 			assoc: raw.assoc, hapd: raw.hapd, hapdStatus: raw.hapdStatus, hints: raw.hints, fdb: raw.fdb,
-			switches: raw.switches, switchState: raw.switchState,
+			switches: raw.switches, switchState: raw.switchState, routes: raw.routes,
 			aliases: this.aliases, rdns: st.rdns, mdns: st.mdns,
 			vendor: st.oui ? function(k) { return k ? st.oui.lookup(k) : null; } : null
 		});
@@ -678,11 +864,23 @@ return view.extend({
 		m.radios.forEach(function(r) { var v = sum(r.ifnames); if (v) st.radioRates[r.id] = v; });
 		st.ssidRates = Object.create(null);
 		m.ssids.forEach(function(s) { var v = s.ifname ? sum([ s.ifname ]) : null; if (v) st.ssidRates[s.id] = v; });
-		var upRate = m.uplink ? st.devRates[m.uplink.statsDev] : null;
+		/* the uplink: the fast lane's own while it samples this uplink's
+		   device; else (no uplink, a new device, the lane stopped) this poll's */
+		var upFast = fast && !!m.uplink && st.fastDev === m.uplink.statsDev;
+		var upRate = upFast ? st.uplinkRate : (m.uplink ? st.devRates[m.uplink.statsDev] : null);
 		st.uplinkRate = upRate || null;
 
 		/* throughput history (only for ticks that produced a rate) */
-		if (upRate) this.pushNet('uplink', at, upRate);
+		if (upRate && !upFast) this.pushNet(lineKey(m.uplink), at, upRate);
+		/* the other lines to the internet: this poll's (the fast lane
+		   samples the main one only) */
+		this.extraLines(m).forEach(function(x) { var r = st.devRates[x.statsDev]; if (r) self.pushNet(lineKey(x), at, r); });
+		/* a line gone for longer than the chart shows leaves no history */
+		var lineKeys = m.uplinks.map(lineKey);
+		Object.keys(st.hist.net).forEach(function(k) {
+			var h = st.hist.net[k];
+			if (/^up:/.test(k) && lineKeys.indexOf(k) < 0 && !(h.length && h[h.length - 1][0] > at - WINDOW_MS)) delete st.hist.net[k];
+		});
 		m.radios.forEach(function(r) { if (st.radioRates[r.id]) self.pushNet(r.id, at, st.radioRates[r.id]); });
 
 		/* station counters, per-station history */
@@ -715,7 +913,7 @@ return view.extend({
 		Object.keys(st.clientHist).slice(0, 32).forEach(function(mac) {
 			keepClients[mac] = st.clientHist[mac].slice(-60).filter(function(p) { return p.every(function(v) { return isFinite(v); }); });
 		});
-		writeStore({ net: st.hist.net, cpu: st.hist.cpu, mem: st.hist.mem, clients: keepClients });
+		writeStore({ sid: storeOwner(), net: st.hist.net, cpu: st.hist.cpu, mem: st.hist.mem, clients: keepClients });
 
 		this.stickyGen(m);
 		m.clients.forEach(function(c) { c.exp = insight.experience(c); c.firstSeen = p.state.firstSeen[c.mac]; c.isNew = !!p.isNew[c.mac]; });
@@ -755,7 +953,63 @@ return view.extend({
 
 	pushNet: function(key, at, r) {
 		var h = this.st.hist.net[key] || (this.st.hist.net[key] = []);
-		series.push(h, [ at, r.rx, r.tx ], WINDOW_MS, HIST_MAX);
+		series.push(h, [ at, r.rx, r.tx ], WINDOW_MS, histMax(key));
+	},
+
+	/* ------------------------------------------------------- fast lane */
+
+	/* the fast lane answered within the last three of its periods: until
+	   then (or if it stops) the full poll samples CPU and the uplink */
+	fastLive: function() {
+		return !!(this.st.fastAt && Date.now() - this.st.fastAt < FAST_S * 3000);
+	},
+
+	/* every FAST_S: CPU from /proc/stat and the uplink device's counters,
+	   with their own previous samples, so the two lanes never mix */
+	refreshFast: function() {
+		var self = this, st = this.st, up = this.m && this.m.uplink, dev = up && up.statsDev;
+		if (document.hidden || !this.el) return Promise.resolve();
+		return Promise.all([
+			L.resolveDefault(callRead('/proc/stat'), ''),
+			dev ? L.resolveDefault(callDev(dev), null) : Promise.resolve(null)
+		]).then(function(r) {
+			/* rates from the browser's clock, samples on the device's timeline */
+			var now = Date.now(), at = now + (st.skew || 0), changed = false;
+			/* back after a pause (a hidden tab) or on another device: start
+			   over, so the first reading isn't an average over the gap */
+			if (!self.fastLive() || st.fastDev !== dev) { st.fastStat = null; st.fastPrev = null; }
+			/* no uplink, or another device: no rate until this one has two samples */
+			if (st.fastDev !== (dev || null) && st.uplinkRate) { st.uplinkRate = null; changed = true; }
+			st.fastDev = dev || null;
+			var stat = model.parseStat(r[0]);
+			if (stat) {
+				var cpu = model.cpuUsage(st.fastStat, stat);
+				if (cpu) { st.cpu = cpu; series.push(st.hist.cpu, [ at, cpu.pct ], WINDOW_MS, HIST_FAST); changed = true; }
+				if (!st.fastStat || stat.all.total !== st.fastStat.all.total) st.fastStat = stat;
+			}
+			var s = r[1] && r[1].statistics, counters = Object.create(null);
+			if (dev && s) counters[dev] = { rx: s.rx_bytes, tx: s.tx_bytes };
+			var dr = model.rates(st.fastPrev, counters, now);
+			st.fastPrev = dr.next;
+			if (dev && dr.rates[dev]) { st.uplinkRate = dr.rates[dev]; self.pushNet(lineKey(up), at, st.uplinkRate); changed = true; }
+			/* both answered: the full poll leaves CPU and the uplink to this lane */
+			if (stat && (!dev || s)) st.fastAt = now;
+			if (changed) self.paintFast();
+		});
+	},
+
+	/* what a fast sample moves: the cards, the verdict, the path's uplink
+	   wire and backdrop, the System tile's CPU, the throughput chart */
+	paintFast: function() {
+		var st = this.st;
+		if (!this.m || !this.el || !this.el.root) return;
+		st.health = insight.health(this.m, { cpu: st.cpu, uplinkRate: st.uplinkRate, temps: st.temps });
+		st.summary = insight.summary(st.health);
+		this.paintHead();
+		this.paintHealth();
+		if (this.hero) this.updateHero();
+		this.paintSystem();
+		this.paintChart();
 	},
 
 	/* names beyond what one poll carries: reverse DNS once per new
@@ -808,7 +1062,7 @@ return view.extend({
 		var m = model.build({
 			board: this.board, info: raw.info, mounts: raw.mounts, ifaces: raw.ifaces, devs: raw.devs, wifi: raw.wifi, iwinfo: raw.iwinfo,
 			assoc: raw.assoc, hapd: raw.hapd, hapdStatus: raw.hapdStatus, hints: raw.hints, fdb: raw.fdb,
-			switches: raw.switches, switchState: raw.switchState,
+			switches: raw.switches, switchState: raw.switchState, routes: raw.routes,
 			aliases: this.aliases, rdns: st.rdns, mdns: st.mdns,
 			vendor: st.oui ? function(k) { return k ? st.oui.lookup(k) : null; } : null
 		});
@@ -825,6 +1079,9 @@ return view.extend({
 	refresh: function() {
 		var self = this;
 		if (document.hidden) { this.st.paused = true; this.paintLive(); return Promise.resolve(); }
+		/* back from a hidden tab: CPU starts over, rather than read as the
+		   average over the time nobody was looking */
+		if (this.st.paused) this.st.stat = null;
 		this.st.paused = false;
 		return this.fetch().then(function(raw) {
 			self.ingest(raw);
@@ -866,10 +1123,15 @@ return view.extend({
 		this.paint();
 
 		poll.add(L.bind(this.refresh, this), POLL_S);
+		poll.add(L.bind(this.refreshFast, this), FAST_S);
 		document.addEventListener('visibilitychange', function() {
-			if (!document.hidden && self.st.paused) self.refresh();
+			if (!document.hidden && self.st.paused && poll.active()) self.refresh();
 			else self.paintLive();
 		});
+		/* LuCI's refresh paused or resumed from its indicator; on resume
+		   CPU starts over, rather than read as the average over the pause */
+		document.addEventListener('poll-stop', function() { window.setTimeout(function() { self.paintLive(); }, 0); });
+		document.addEventListener('poll-start', function() { self.st.stat = null; self.paintLive(); });
 		document.addEventListener('keydown', L.bind(this.handleKey, this));
 		window.setInterval(function() { self.paintLive(); }, 1000);
 		if (window.ResizeObserver) {
@@ -1068,11 +1330,20 @@ return view.extend({
 		var l = this.lay;
 		if (!l) return;
 		var k = layout.key(l.tier, l.wired);
-		if (layout.same(list, layout.defaults(l.tier, l.wired))) delete this.layouts[k];
+		if (layout.same(list, layout.defaults(l.tier, l.wired))) this.clearLayout(k);
 		else this.layouts[k] = layout.compact(list);
 		writeLayouts(this.layouts);
+		this.viewChanged(layout.option(k));
 		this.held = Object.create(null);
 		this.doLayout();
+	},
+
+	/* back to the default. The router's layout would come back on reload
+	   (for a login that can't save, or before Done), so this browser keeps
+	   an empty one of its own, which normalize reads as the default. */
+	clearLayout: function(k) {
+		if (k in layout.decode(lookAttr('data-vt-look-layout'))) this.layouts[k] = [];
+		else delete this.layouts[k];
 	},
 
 	editTile: function(id, fn, say) {
@@ -1090,7 +1361,10 @@ return view.extend({
 		window.setTimeout(function() { txt(s, text); }, 30);
 	},
 
-	setEditing: function(on) {
+	/* leave: close without saving (Esc or the Customize button after a
+	   failed save; Done tries again) */
+	setEditing: function(on, leave) {
+		if (!on && this.editing && !leave && this.saveView()) return;
 		this.editing = !!on;
 		this.el.root.classList.toggle('vt-editing', this.editing);
 		this.el.layoutBtn.setAttribute('aria-pressed', String(this.editing));
@@ -1099,8 +1373,56 @@ return view.extend({
 		   at once, nothing held from the other mode */
 		this.held = Object.create(null);
 		this.doLayout();
-		if (this.editing) this.el.editDone.focus();
+		if (this.editing) {
+			this.viewFailed = false;
+			this.editNote(lookAttr('data-vt-look-save') === 'relogin' ? _('Log in again to save this for every browser.') : '');
+			this.el.editDone.focus();
+		}
 		else this.el.layoutBtn.focus();
+	},
+
+	editNote: function(text) {
+		this.el.editNote.hidden = !text;
+		txt(this.el.editNote, text);
+	},
+
+	/* the options of /etc/config/vantage_theme this dashboard stands for */
+	viewValues: function() {
+		var self = this, out = { chart: this.chartStyle };
+		[ 'wide', 'mid', 'narrow' ].forEach(function(tier) {
+			[ false, true ].forEach(function(wired) {
+				var k = layout.key(tier, wired);
+				out[layout.option(k)] = self.layouts[k] && self.layouts[k].length ? layout.encode(self.layouts[k]) : 'default';
+			});
+		});
+		return out;
+	},
+
+	/* this option changed under Customize, for a login that may save it */
+	viewChanged: function(opt) {
+		if (!lookSaves()) return;
+		var list = readUnsaved();
+		if (list.indexOf(opt) < 0) writeUnsaved(list.concat(opt));
+	},
+
+	/* Done: what changed goes to the theme in one write. True while that
+	   runs: Customize closes when it is saved, and stays open with a note
+	   if it was not, so the pick can be saved again. */
+	saveView: function() {
+		var self = this, now = this.viewValues(), out = {};
+		if (this.viewSaving) return true;
+		readUnsaved().forEach(function(k) { out[k] = now[k]; });
+		if (!Object.keys(out).length) return false;
+		this.viewSaving = offerView(out, function(ok) {
+			self.viewSaving = false;
+			self.viewFailed = !ok;
+			if (!ok) { self.editNote(_('Could not save this for every browser. Try again.')); return; }
+			/* anything changed since it was sent goes out on this close */
+			var then = self.viewValues();
+			writeUnsaved(readUnsaved().filter(function(k) { return then[k] !== out[k]; }));
+			self.setEditing(false);
+		});
+		return this.viewSaving;
 	},
 
 	/* the throughput chart style, picked under Customize */
@@ -1118,26 +1440,39 @@ return view.extend({
 		return E('div', { 'class': 'vt-edit-field' }, [ E('label', { 'for': 'vt-chart-style' }, [ _('Throughput chart') ]), pick ]);
 	},
 
-	/* the network path's backdrop, picked under Customize */
+	/* the network path's backdrop, picked under Customize; under the
+	   Vantage theme it is in Appearance instead (menu-vantage.js) */
 	buildBackdropPick: function() {
+		if (vantageTheme()) return '';
 		var self = this, names = { 'grid': _('Grid packets'), 'stars': _('Starfield'), 'none': _('None') };
 		var pick = E('select', { 'class': 'vt-select', 'id': 'vt-backdrop-style', 'change': function(ev) { self.setBackdrop(ev.target.value); } },
 			backdrop.STYLES.map(function(k) { return E('option', { 'value': k }, [ names[k] ]); }));
 		pick.value = this.backdropStyle;
+		this.backdropPick = pick;
 		return E('div', { 'class': 'vt-edit-field' }, [ E('label', { 'for': 'vt-backdrop-style' }, [ _('Network path background') ]), pick ]);
 	},
 
+	/* picked here (Customize): saved, and shown */
 	setBackdrop: function(v) {
 		if (backdrop.STYLES.indexOf(v) < 0 || v === this.backdropStyle) return;
-		this.backdropStyle = v;
 		writeBackdrop(v);
+		this.showBackdrop(v);
+	},
+
+	/* picked elsewhere (the theme's Appearance, another tab): shown only,
+	   never saved back */
+	showBackdrop: function(v) {
+		if (backdrop.STYLES.indexOf(v) < 0 || v === this.backdropStyle) return;
+		this.backdropStyle = v;
 		if (this.backdrop) this.backdrop.style(v);
+		if (this.backdropPick && this.backdropPick.value !== v) this.backdropPick.value = v;
 	},
 
 	setChartStyle: function(v) {
 		if (series.CHART_STYLES.indexOf(v) < 0 || v === this.chartStyle) return;
 		this.chartStyle = v;
 		writeChartStyle(v);
+		this.viewChanged('chart');
 		this.chartHide();
 		this.paintChart();
 	},
@@ -1145,18 +1480,20 @@ return view.extend({
 	buildEditBar: function() {
 		var self = this, el = this.el;
 		el.editHint = E('span', { 'class': 'vt-hint' });
+		el.editNote = E('span', { 'class': 'vt-edit-note', 'role': 'status', 'hidden': 'hidden' });
 		el.editHidden = E('div', { 'class': 'vt-edit-hidden' });
 		el.editSay = E('span', { 'class': 'vt-sr', 'role': 'status', 'aria-live': 'polite' });
 		el.editBar = E('div', { 'class': 'vt-editbar', 'role': 'region', 'aria-label': _('Customize the dashboard'), 'hidden': 'hidden' }, [
-			E('div', { 'class': 'vt-editbar-text' }, [ E('strong', {}, [ _('Customize the dashboard') ]), el.editHint ]),
+			E('div', { 'class': 'vt-editbar-text' }, [ E('strong', {}, [ _('Customize the dashboard') ]), el.editHint, el.editNote ]),
 			el.editHidden,
 			E('div', { 'class': 'vt-edit-picks' }, [ this.buildChartPick(), this.buildBackdropPick() ]),
 			E('div', { 'class': 'vt-editbar-actions' }, [
 				E('button', { 'type': 'button', 'class': 'vt-btn', 'click': function() {
 					var l = self.lay;
 					if (!l) return;
-					delete self.layouts[layout.key(l.tier, l.wired)];
+					self.clearLayout(layout.key(l.tier, l.wired));
 					writeLayouts(self.layouts);
+					self.viewChanged(layout.option(layout.key(l.tier, l.wired)));
 					self.held = Object.create(null);
 					self.doLayout();
 					self.announce(_('Layout reset'));
@@ -1221,9 +1558,10 @@ return view.extend({
 		var self = this, l = this.lay;
 		if (!l) return;
 		var shown = l.list.filter(function(e) { return !e.hide; });
-		txt(this.el.editHint, l.tier === 'wide' ? _('Drag a tile by its handle or use its buttons. Saved in this browser for wide screens.')
-			: l.tier === 'mid' ? _('Drag a tile by its handle or use its buttons. Saved in this browser for medium screens.')
-			: _('Drag a tile by its handle or use its buttons. Saved in this browser for narrow screens.'));
+		var every = lookSaves();
+		txt(this.el.editHint, l.tier === 'wide' ? (every ? _('Drag a tile by its handle or use its buttons. Done saves it for wide screens in every browser.') : _('Drag a tile by its handle or use its buttons. Saved in this browser for wide screens.'))
+			: l.tier === 'mid' ? (every ? _('Drag a tile by its handle or use its buttons. Done saves it for medium screens in every browser.') : _('Drag a tile by its handle or use its buttons. Saved in this browser for medium screens.'))
+			: every ? _('Drag a tile by its handle or use its buttons. Done saves it for narrow screens in every browser.') : _('Drag a tile by its handle or use its buttons. Saved in this browser for narrow screens.'));
 		this.el.root.classList.toggle('vt-edit-1col', l.cols === 1);
 		shown.forEach(function(e, i) {
 			var o = self.ov[e.id];
@@ -1336,56 +1674,194 @@ return view.extend({
 				el.liveText = E('span', { 'class': 'vt-live-text' })
 			]),
 			el.layoutBtn = E('button', { 'type': 'button', 'class': 'vt-btn vt-btn-ghost vt-layout-btn', 'aria-pressed': 'false',
-				'title': _('Customize the dashboard'), 'click': L.bind(function() { this.setEditing(!this.editing); }, this) }, [
+				'title': _('Customize the dashboard'), 'click': L.bind(function() { this.setEditing(!this.editing, this.viewFailed); }, this) }, [
 				icon('layout'), E('span', {}, [ _('Customize') ])
 			])
 		]);
 	},
 
+	/* the device and its clients; the firmware is in the System tile */
 	paintHead: function() {
-		var s = this.st.summary, d = this.m.device;
+		var s = this.st.summary, clients = this.m.clients.length;
 		this.el.orb.className = 'vt-orb vt-orb-' + s.level;
+		/* the Vantage theme's refresh dot pulses fast in the same colour
+		   while something needs attention (vantage.css) */
+		document.documentElement.setAttribute('data-vt-alert', s.level === 'warn' || s.level === 'err' ? s.level : '');
 		txt(this.el.headline, s.headline);
-		var clients = this.m.clients.length;
-		txt(this.el.subline, [ d.model, d.hostname, d.firmware ? d.firmware.replace(/\s+r\d+-[0-9a-f]+$/, '') : null,
-			this.m.wired ? null : clients === 1 ? _('1 client') : _('%d clients').format(clients) ].filter(Boolean).join('  ·  '));
+		txt(this.el.subline, this.identity(this.m.device).concat(
+			this.m.wired ? [] : [ clients === 1 ? _('1 client') : _('%d clients').format(clients) ]).join('  ·  '));
+	},
+
+	/* model and hostname, or the one of them that holds the other
+	   ("Example AX3000", "example-ax3000"), compared in lower case on
+	   letters and digits only */
+	identity: function(d) {
+		/* letters and digits of any script, as the theme's host chip compares them */
+		var key = function(v) { return String(v || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ''); };
+		var a = key(d.model), b = key(d.hostname);
+		if (a && b && a.indexOf(b) >= 0) return [ d.model ];
+		if (a && b && b.indexOf(a) >= 0) return [ d.hostname ];
+		return [ d.model, d.hostname ].filter(Boolean);
 	},
 
 	paintLive: function() {
 		if (!this.el || !this.el.live) return;
 		var st = this.st, state, label;
-		if (st.paused || document.hidden) { state = 'paused'; label = _('Paused while hidden'); }
+		/* LuCI's own refresh can be paused (its indicator in the header) */
+		var stopped = typeof poll.active === 'function' && !poll.active();
+		if (st.paused || document.hidden || stopped) { state = 'paused'; label = stopped && !document.hidden ? _('Paused') : _('Paused while hidden'); }
 		else if (st.lastErr) { state = 'err'; label = _('Reconnecting…', 'vantage'); }
 		else { state = 'ok'; label = _('Live') + ' · ' + fmt.ago(Date.now() - st.lastOk); }
 		this.el.live.className = 'vt-livepill vt-live-' + state;
+		/* the Vantage theme's refresh dot pulses fast and amber while this
+		   reconnects (vantage.css) */
+		document.documentElement.setAttribute('data-vt-live', state);
+		/* the Vantage theme's poll indicator already says the page is
+		   live, or that its refresh is paused: then this pill shows only
+		   when neither */
+		this.el.live.hidden = (state === 'ok' || stopped) && vantageTheme();
 		this.el.live.setAttribute('title', label);
 		txt(this.el.liveText, label);
+		this.setMotion(state !== 'paused');
+	},
+
+	/* Nothing moves while the page is paused: the status circle's ring
+	   (app.css, .vt-still), the flow dots stay where they are and the
+	   backdrop keeps its last frame. */
+	setMotion: function(on) {
+		if (this.motionOn === on) return;
+		this.motionOn = on;
+		if (this.el && this.el.root) this.el.root.classList.toggle('vt-still', !on);
+		var map = this.wireMap || {};
+		Object.keys(map).forEach(function(k) {
+			map[k].anims.forEach(function(a) { if (on) a.play(); else a.pause(); });
+		});
+		if (this.backdrop) this.backdrop.pause(!on);
 	},
 
 	/* ----------------------------------------------------------- health */
 
+	/* The health cards: each check with its own icon, tinted only when it
+	   needs attention, its value and reason, and a small picture of the
+	   last minutes or of how full it is. A change of shape (which checks,
+	   a level, where one leads) rebuilds them; otherwise the text and the
+	   pictures update in place, so a focused card keeps its focus. */
 	paintHealth: function() {
-		var self = this;
-		/* the same checks as last poll: leave the chips alone */
-		var sig = JSON.stringify(this.st.health.map(function(c) { return [ c.level, c.title, c.value, c.reason, c.detail, c.client, c.list, c.page ]; }));
-		if (sig === this.healthSig) return;
-		this.healthSig = sig;
-		dom.content(this.el.health, this.st.health.map(function(c) {
-			var ic = c.level === 'ok' ? 'check' : c.level === 'err' ? 'err' : c.level === 'warn' ? 'warn' : 'info';
-			var body = [
-				E('span', { 'class': 'vt-chip-ico' }, [ icon(ic) ]),
-				E('span', { 'class': 'vt-chip-main' }, [
-					E('span', { 'class': 'vt-chip-top' }, [ E('span', { 'class': 'vt-chip-title' }, [ c.title ]), E('span', { 'class': 'vt-chip-value' }, [ c.value ]) ]),
-					E('span', { 'class': 'vt-chip-reason' }, [ c.reason ])
-				])
-			];
-			if (c.client || c.list)
-				return E('button', { 'type': 'button', 'class': 'vt-chip vt-chip-' + c.level, 'role': 'listitem', 'title': c.detail || c.reason,
-					'click': function() { self.openCheck(c); } }, body);
-			/* without its page (no block-mount), a check links to the status overview */
-			var to = hasPage(c.page) ? c.page : [ 'admin', 'status', 'overview' ];
-			return E('a', { 'class': 'vt-chip vt-chip-' + c.level, 'role': 'listitem', 'title': c.detail || c.reason, 'href': L.url.apply(L, to) }, body);
-		}));
+		var self = this, checks = this.st.health;
+		var shape = JSON.stringify(checks.map(function(c) { return [ c.id, c.level, !!(c.client || c.list), c.page ]; }));
+		if (shape !== this.healthShape) {
+			this.healthShape = shape;
+			this.healthCells = checks.map(function(c) {
+				var cell = {
+					title: E('span', { 'class': 'vt-chip-title' }),
+					value: E('span', { 'class': 'vt-chip-value vt-tn' }),
+					reason: E('span', { 'class': 'vt-chip-reason' }),
+					viz: E('span', { 'class': 'vt-chip-viz', 'aria-hidden': 'true' })
+				};
+				var body = [
+					E('span', { 'class': 'vt-chip-ico' }, [ icon(CHECK_ICONS[c.id] || 'info') ]),
+					/* the level in words too, for screen readers (the card says it in colour) */
+					E('span', { 'class': 'vt-chip-main' }, [ E('span', { 'class': 'vt-chip-top' }, [
+						c.level === 'err' || c.level === 'warn' ? E('span', { 'class': 'vt-sr' }, [ c.level === 'err' ? _('Error') : _('Warning') ]) : '',
+						cell.title, cell.value ]), cell.reason, cell.viz ])
+				];
+				if (c.client || c.list)
+					cell.el = E('button', { 'type': 'button', 'class': 'vt-chip vt-chip-' + c.level + ' vt-chip-k-' + c.id, 'role': 'listitem',
+						'click': function() { self.openCheck(cell.check); } }, body);
+				else {
+					/* without its page (no block-mount), a check links to the status overview */
+					var to = hasPage(c.page) ? c.page : [ 'admin', 'status', 'overview' ];
+					cell.el = E('a', { 'class': 'vt-chip vt-chip-' + c.level + ' vt-chip-k-' + c.id, 'role': 'listitem', 'href': L.url.apply(L, to) }, body);
+				}
+				return cell;
+			});
+			dom.content(this.el.health, this.healthCells.map(function(cell) { return cell.el; }));
+		}
+		this.healthCells.forEach(function(cell, i) {
+			var c = checks[i];
+			cell.check = c;
+			txt(cell.title, c.title);
+			txt(cell.value, c.value);
+			txt(cell.reason, c.reason);
+			setTitle(cell.el, c.detail || c.reason);
+			patch(cell.viz, self.checkPicture(c));
+		});
+	},
+
+	/* the small picture under a health card: the last five minutes for
+	   what moves (uplink traffic, CPU), how full for what fills (memory,
+	   storage), each radio's airtime, and how the clients' signals spread */
+	checkPicture: function(c) {
+		var st = this.st, d = (this.m && this.m.device) || {};
+		switch (c.id) {
+		/* the download (the card says the upload) and CPU as an area along
+		   the card's bottom edge; CPU scaled to at least 20 % so a quiet
+		   device still shows its shape */
+		case 'uplink':
+			return [ sparkline((this.m && this.m.uplink && st.hist.net[lineKey(this.m.uplink)]) || [], [ 1 ], 0, 'vt-spark-up', { min: 1000, quiet: true, bare: true }) ];
+		case 'cpu':
+			return [ sparkline(st.hist.cpu || [], [ 1 ], 0, 'vt-spark-cpu', { min: 20, quiet: true, bare: true }) ];
+		case 'memory':
+			/* in use, then the reclaimable cache (part of what is available), as in the System tile */
+			if (!d.memory || !d.memory.segments) return [];
+			return [ E('span', { 'class': 'vt-chip-bar vt-chip-mem' + (c.level === 'ok' ? '' : ' vt-chip-mem-' + c.level) }, d.memory.segments.filter(function(g) { return g.key !== 'free'; }).map(function(g) {
+				var x = E('span', { 'class': 'vt-chip-mem-' + g.key });
+				setW(x, g.pct);
+				return x;
+			})) ];
+		case 'storage':
+			return (d.storage || [])[0] ? [ fillBar(d.storage[0].usedPct, c.level) ] : [];
+		case 'radios':
+			return this.radioPicture();
+		case 'signal':
+			return this.signalPicture();
+		}
+		return [];
+	},
+
+	/* each radio's airtime (how busy its channel is) as a short bar under
+	   its band; nothing where the driver doesn't report airtime */
+	radioPicture: function() {
+		var radios = ((this.m && this.m.radios) || []).filter(function(r) { return !r.disabled && r.airtime != null; });
+		if (!radios.length) return this.bandPicture();
+		/* two radios on one band: each by its channel too */
+		var perBand = {};
+		radios.forEach(function(r) { perBand[r.band] = (perBand[r.band] || 0) + 1; });
+		return [ E('span', { 'class': 'vt-chip-radios' }, radios.map(function(r) {
+			var name = (r.bandLabel || r.id) + (perBand[r.band] > 1 && r.channel ? ' · ' + r.channel : '');
+			return E('span', { 'class': 'vt-chip-radio vt-band-' + (r.band || 'x') }, [
+				E('span', { 'class': 'vt-chip-radio-top' }, [ E('span', {}, [ name ]), E('b', { 'class': 'vt-tn' }, [ fmt.pct(r.airtime) ]) ]),
+				/* in its band's colour; the figure says how busy */
+				fillBar(r.airtime, 'ok')
+			]);
+		})) ];
+	},
+
+	/* without airtime: the Wi-Fi clients by band along the card's bottom
+	   edge, in the bands' colours (as the other cards' lines) */
+	bandPicture: function() {
+		var clients = (this.m && this.m.clients) || [], by = {};
+		clients.forEach(function(c) { if (c.band) by[c.band] = (by[c.band] || 0) + 1; });
+		var bands = Object.keys(by).sort();
+		if (!bands.length) return [];
+		return [ E('span', { 'class': 'vt-chip-dist vt-chip-bands' }, bands.map(function(b) {
+			var x = E('span', { 'class': 'vt-chip-band vt-band-' + b });
+			setW(x, by[b] / clients.length * 100);
+			return x;
+		})) ];
+	},
+
+	/* the clients by signal class (wifi.signal), weakest on the right */
+	signalPicture: function() {
+		var clients = ((this.m && this.m.clients) || []).filter(function(c) { return c.signal != null; });
+		if (!clients.length) return [];
+		var by = { 4: 0, 3: 0, 2: 0, 1: 0 };
+		clients.forEach(function(c) { var b = wifi.signal(c.signal).bars; if (by[b] != null) by[b]++; });
+		return [ E('span', { 'class': 'vt-chip-dist' }, [ 4, 3, 2, 1 ].filter(function(b) { return by[b]; }).map(function(b) {
+			var s = E('span', { 'class': 'vt-dist-' + b });
+			setW(s, by[b] / clients.length * 100);
+			return s;
+		})) ];
 	},
 
 	/* ------------------------------------------------------------- hero */
@@ -1400,11 +1876,9 @@ return view.extend({
 		el.path.appendChild(el.flows);
 		this.wireMap = Object.create(null);
 		this.hero = null;
-		el.kpis = E('div', { 'class': 'vt-kpis vt-fold-keep' });
 		var tile = this.foldable('hero', E('section', { 'class': 'vt-tile vt-hero', 'aria-label': _('Network path') }, [
-			tileHead('pulse', _('Network path'), [ E('span', { 'class': 'vt-hint vt-hint-wide' }, [ _('Click any node for details') ]), this.foldButton('hero', _('Show or hide the network path')) ]),
-			el.path,
-			el.kpis
+			tileHead('pulse', _('Network path'), [ this.foldButton('hero', _('Show or hide the network path')) ]),
+			el.path
 		]));
 		/* packets or stars behind the path, moved by the uplink's rate */
 		this.backdrop = backdrop.mount(tile, el.path, this.backdropStyle);
@@ -1412,26 +1886,39 @@ return view.extend({
 	},
 
 	/* the nodes the path shows: rebuilt only when this changes (a radio,
-	   SSID or network comes or goes); a poll updates text in place */
+	   SSID, network or wired port comes or goes); a poll updates text in
+	   place */
 	heroKey: function() {
-		var m = this.m;
-		if (m.wired) return 'w\n' + m.networks.filter(function(n) { return n.up; }).slice(0, 8).map(function(n) { return n.name; }).join('\n');
+		var m = this.m, tail = '\nwired=' + this.wiredPorts().join(',') + '\nlines=' + this.extraLines().map(function(x) { return x.iface; }).join(',');
+		if (m.wired) return 'w\n' + m.networks.filter(function(n) { return n.up; }).slice(0, 8).map(function(n) { return n.name; }).join('\n') + tail;
 		return 'r\n' + m.radios.map(function(r) {
 			return r.id + '=' + m.ssids.filter(function(s) { return s.radio === r.id; }).map(function(s) { return s.id; }).join(',');
-		}).join('\n') + '\nwired=' + this.wiredPorts().join(',');
+		}).join('\n') + tail;
+	},
+
+	/* the lines to the internet beside the main one (failover, mwan3;
+	   at most model.MAX_LINES) */
+	extraLines: function(m) {
+		m = m || this.m;
+		return ((m && m.uplinks) || []).slice(1);
 	},
 
 	/* the ports with wired hosts downstream of this device, at most 8:
-	   hosts on the uplink's port are the way to the gateway, not clients
+	   hosts on a line's port are the way to its gateway, not clients
 	   (on a bridge with several ports whose gateway port is unknown, only
 	   the gateway is left out) */
 	wiredPorts: function() {
-		var m = this.m, up = m.uplink, out = [];
+		var m = this.m, out = [], self = this;
 		(m.wiredHosts || []).forEach(function(c) {
-			if (c.gateway || (up && up.port && c.port === up.port)) return;
+			if (c.gateway || self.linePort(c.port)) return;
 			if (out.indexOf(c.port) < 0) out.push(c.port);
 		});
 		return out.sort().slice(0, 8);
+	},
+
+	/* the port is one a line to the internet leaves through */
+	linePort: function(port) {
+		return ((this.m && this.m.uplinks) || []).some(function(x) { return x.port && x.port === port; });
 	},
 
 	/* the Clients tile on its wired list, on one port's hosts or all */
@@ -1462,7 +1949,6 @@ return view.extend({
 		var key = this.heroKey();
 		if (!this.hero || this.hero.key !== key) this.buildHeroNodes(key);
 		this.updateHero();
-		this.paintKpis();
 		this.paintWireState();
 	},
 
@@ -1476,18 +1962,40 @@ return view.extend({
 			if (c !== self.el.wires && c !== self.el.flows) path.removeChild(c);
 		});
 
-		h.gwKicker = span('vt-node-kicker'); h.gwTitle = span('vt-node-title'); h.gwSub = span('vt-node-sub');
-		h.gw = E('button', { 'type': 'button', 'class': 'vt-node vt-node-gw', 'click': function() { self.openDrawer('uplink', 'uplink'); } }, [
+		/* more than one line to the internet: each by its interface, the
+		   main one (the default route the kernel takes) marked */
+		var extra = this.extraLines();
+		h.gwKicker = span(extra.length ? 'vt-node-name' : 'vt-node-kicker'); h.gwTitle = span('vt-node-title'); h.gwSub = span('vt-node-sub');
+		h.gwTag = extra.length ? E('span', { 'class': 'vt-node-tag' }, [ _('default route') ]) : null;
+		h.gw = E('button', { 'type': 'button', 'class': 'vt-node vt-node-gw', 'click': function() { self.openDrawer('uplink', ''); } }, [
 			E('span', { 'class': 'vt-node-ico' }, [ icon('globe') ]),
-			E('span', { 'class': 'vt-node-body' }, [ h.gwKicker, h.gwTitle, h.gwSub ])
+			E('span', { 'class': 'vt-node-body' }, [
+				h.gwTag ? E('span', { 'class': 'vt-node-kicker vt-node-kicker-tag' }, [ h.gwKicker, h.gwTag ]) : h.gwKicker,
+				h.gwTitle, h.gwSub
+			])
 		]);
+		h.lines = extra.map(function(x) {
+			/* its rates as two items, so a narrow node wraps them rather than cut them */
+			var ln = { id: x.iface, kicker: span('vt-node-name'), title: span('vt-node-title'), dn: E('span'), up: E('span') };
+			ln.el = E('button', { 'type': 'button', 'class': 'vt-node vt-node-gw vt-node-line', 'click': function() { self.openDrawer('uplink', ln.id); } }, [
+				E('span', { 'class': 'vt-node-ico' }, [ icon('globe') ]),
+				E('span', { 'class': 'vt-node-body' }, [ E('span', { 'class': 'vt-node-kicker' }, [ ln.kicker ]), ln.title, E('span', { 'class': 'vt-node-sub vt-node-rates vt-tn' }, [ ln.dn, ln.up ]) ])
+			]);
+			return ln;
+		});
+		h.linesEl = extra.length ? E('div', { 'class': 'vt-lines' }, h.lines.map(function(ln) { return ln.el; })) : null;
+		setClass(path, 'vt-path' + (extra.length ? ' vt-path-lines' : ''));
 
 		h.dnVal = E('b'); h.dnUnit = E('small'); h.upVal = E('b'); h.upUnit = E('small'); h.linkMeta = span('vt-link-meta');
+		/* a full-tunnel VPN over the line: named on the link it runs through */
+		h.tunName = span('vt-link-tunnel-name'); h.tunProto = span('vt-link-tunnel-proto');
+		h.tunnel = E('span', { 'class': 'vt-link-tunnel', 'hidden': '' }, [ icon('lock'), h.tunName, h.tunProto ]);
 		h.link = E('div', { 'class': 'vt-link-label' }, [
 			E('span', { 'class': 'vt-link-rate vt-link-down' }, [ icon('down'), h.dnVal, h.dnUnit ]),
 			E('span', { 'class': 'vt-link-below' }, [
 				E('span', { 'class': 'vt-link-rate vt-link-up' }, [ icon('up'), h.upVal, h.upUnit ]),
-				h.linkMeta
+				h.linkMeta,
+				h.tunnel
 			])
 		]);
 
@@ -1499,6 +2007,7 @@ return view.extend({
 
 		h.branches = E('div', { 'class': 'vt-branches' });
 		h.watch = [ path, h.gw, h.link, h.ap, h.branches ];
+		h.lines.forEach(function(ln) { h.watch.push(ln.el); });
 		if (m.wired) {
 			m.networks.filter(function(n) { return n.up; }).slice(0, 8).forEach(function(n) {
 				var b = { id: n.name, ssids: [], kicker: span('vt-node-kicker'), title: span('vt-node-title'), addr: span('vt-node-sub vt-mono'), sub: span('vt-node-sub vt-tn') };
@@ -1532,26 +2041,26 @@ return view.extend({
 				h.radios.push(b);
 			});
 			if (!h.radios.length) h.branches.appendChild(E('div', { 'class': 'vt-empty-inline' }, [ _('No radios reported') ]));
-			/* wired hosts downstream: one branch beside the radios, a node
-			   per port */
-			var ports = this.wiredPorts();
-			if (ports.length) {
-				var wb = { id: 'wired', wired: true, ssids: [], title: span('vt-node-title vt-tn'), sub: span('vt-node-sub vt-tn') };
-				wb.el = E('button', { 'type': 'button', 'class': 'vt-node vt-node-radio', 'click': function() { self.showWired(null); } }, [
-					E('span', { 'class': 'vt-node-body' }, [ E('span', { 'class': 'vt-node-kicker' }, [ _('Wired') ]), wb.title, wb.sub ])
+		}
+		/* wired hosts downstream: one branch beside the radios or the
+		   networks, a node per port; its id is no interface's name */
+		var ports = this.wiredPorts();
+		if (ports.length) {
+			var wb = { id: ':wired', wired: true, ssids: [], title: span('vt-node-title vt-tn'), sub: span('vt-node-sub vt-tn') };
+			wb.el = E('button', { 'type': 'button', 'class': 'vt-node vt-node-radio', 'click': function() { self.showWired(null); } }, [
+				E('span', { 'class': 'vt-node-body' }, [ E('span', { 'class': 'vt-node-kicker' }, [ _('Wired') ]), wb.title, wb.sub ])
+			]);
+			var wcol = E('div', { 'class': 'vt-branch-ssids' });
+			ports.forEach(function(p) {
+				var sn = { id: 'port:' + p, port: p, name: E('span'), count: span('vt-tn'), rate: span('vt-node-sub vt-tn') };
+				sn.el = E('button', { 'type': 'button', 'class': 'vt-node vt-node-ssid', 'click': function() { self.showWired(p); } }, [
+					E('span', { 'class': 'vt-node-body' }, [ E('span', { 'class': 'vt-node-title vt-ssid-name' }, [ sn.name ]), E('span', { 'class': 'vt-node-sub' }, [ sn.count ]), sn.rate ])
 				]);
-				var wcol = E('div', { 'class': 'vt-branch-ssids' });
-				ports.forEach(function(p) {
-					var sn = { id: 'port:' + p, port: p, name: E('span'), count: span('vt-tn'), rate: span('vt-node-sub vt-tn') };
-					sn.el = E('button', { 'type': 'button', 'class': 'vt-node vt-node-ssid', 'click': function() { self.showWired(p); } }, [
-						E('span', { 'class': 'vt-node-body' }, [ E('span', { 'class': 'vt-node-title vt-ssid-name' }, [ sn.name ]), E('span', { 'class': 'vt-node-sub' }, [ sn.count ]), sn.rate ])
-					]);
-					wb.ssids.push(sn);
-					wcol.appendChild(sn.el);
-				});
-				wb.wrap = E('div', { 'class': 'vt-branch' }, [ wb.el, wcol ]);
-				h.radios.push(wb);
-			}
+				wb.ssids.push(sn);
+				wcol.appendChild(sn.el);
+			});
+			wb.wrap = E('div', { 'class': 'vt-branch' }, [ wb.el, wcol ]);
+			h.radios.push(wb);
 		}
 		h.radios.forEach(function(b) {
 			h.branches.appendChild(b.wrap);
@@ -1561,6 +2070,8 @@ return view.extend({
 
 		path.insertBefore(h.gw, this.el.wires);
 		path.insertBefore(h.link, this.el.wires);
+		/* after the main line's rates: on a phone they stay with it */
+		if (h.linesEl) path.insertBefore(h.linesEl, this.el.wires);
 		path.insertBefore(h.ap, this.el.wires);
 		path.insertBefore(h.branches, this.el.wires);
 		this.hero = h;
@@ -1578,7 +2089,7 @@ return view.extend({
 		   name once one is known beyond its vendor */
 		var gwHost = (m.wiredHosts || []).filter(function(c) { return c.gateway; })[0];
 		var gwName = gwHost && /^(alias|dhcp|mdns|dns)$/.test(gwHost.nameSource) ? gwHost.name : null;
-		txt(h.gwKicker, up && up.isWan ? _('Internet') : _('Gateway'));
+		txt(h.gwKicker, h.lines.length && up ? up.iface : up && up.isWan ? _('Internet') : _('Gateway'));
 		txt(h.gwTitle, gwName || (up && up.gateway ? up.gateway : up && up.defaultRoute ? up.l3dev : _('No default route', 'vantage')));
 		txt(h.gwSub, gwName ? up.gateway : up && up.dns.length ? _('DNS %s').format(up.dns[0]) : _('Reachability not probed'));
 
@@ -1587,6 +2098,13 @@ return view.extend({
 		txt(h.upVal, upR ? fmt.bitsParts(upR.tx).v : fmt.DASH);
 		txt(h.upUnit, upR ? fmt.bitsParts(upR.tx).u : '');
 		txt(h.linkMeta, up ? [ up.dev, up.speed ? (up.speed.mbps >= 1000 ? (up.speed.mbps / 1000) + 'G' : up.speed.mbps + 'M') + (up.speed.duplex === 'full' ? ' FD' : up.speed.duplex === 'half' ? ' HD' : '') : null ].filter(Boolean).join(' · ') : _('no uplink'));
+		var tun = up && up.tunnel, tunR = tun ? st.devRates[tun.dev] : null;
+		if (h.tunnel.hidden !== !tun) h.tunnel.hidden = !tun;
+		txt(h.tunName, tun ? tun.iface : '');
+		txt(h.tunProto, tun && tun.proto ? tun.proto : '');
+		setTitle(h.tunnel, tun ? _('Traffic to the internet goes through %s, a tunnel over this line').format(tun.iface) +
+			(tunR ? ' · ↓ ' + fmt.bits(tunR.rx) + ' · ↑ ' + fmt.bits(tunR.tx) : '') : '');
+		if (h.gwTag) txt(h.gwTag, tun ? _('default route via %s').format(tun.iface) : _('default route'));
 
 		txt(h.apKicker, m.wired ? _('This device') : _('This access point'));
 		txt(h.apTitle, d.model);
@@ -1596,10 +2114,27 @@ return view.extend({
 		h.upRate = upR ? upR.rx + upR.tx : 0;
 		if (this.backdrop) this.backdrop.update({ down: upR ? upR.rx : null, up: upR ? upR.tx : null, origin: h.ap });
 
+		var lines = Object.create(null);
+		this.extraLines().forEach(function(x) { lines[x.iface] = x; });
+		h.lines.forEach(function(ln) {
+			var x = lines[ln.id], r = x ? st.devRates[x.statsDev] : null;
+			if (!x) return;
+			setTitle(ln.el, [ x.iface, x.dev, x.speed ? model.speedLabel(x.speed) : null ].filter(Boolean).join(' · '));
+			setClass(ln.el, 'vt-node vt-node-gw vt-node-line' + (x.carrier === false ? ' vt-node-off' : ''));
+			txt(ln.kicker, x.iface);
+			txt(ln.title, x.gateway || x.l3dev);
+			var p = r && !(r.rx === 0 && r.tx === 0) ? fmt.rateParts(r.rx, r.tx) : null;
+			txt(ln.dn, p ? '↓ ' + p.dn : r ? _('idle') : fmt.DASH);
+			txt(ln.up, p ? '↑ ' + p.up + (p.unit ? ' ' + p.unit : '') : '');
+			ln.active = !!(r && r.rx + r.tx > 50e3);
+			ln.rate = r ? r.rx + r.tx : 0;
+		});
+
 		if (m.wired) {
 			var nets = Object.create(null);
 			m.networks.forEach(function(n) { if (n.up && !nets[n.name]) nets[n.name] = n; });
 			h.radios.forEach(function(b) {
+				if (b.wired) { self.updateWiredBranch(b); return; }
 				var n = nets[b.id];
 				if (!n) return;
 				var r = n.dev ? st.devRates[n.dev] : null;
@@ -1607,7 +2142,7 @@ return view.extend({
 				txt(b.kicker, n.proto || _('Interface'));
 				txt(b.title, n.name);
 				txt(b.addr, n.ipv4 ? n.ipv4.split('/')[0] : (n.dev || fmt.DASH));
-				txt(b.sub, r ? '↓ ' + fmt.bitsShort(r.tx) + '  ↑ ' + fmt.bitsShort(r.rx) : fmt.DASH);
+				txt(b.sub, r ? fmt.rates(r.tx, r.rx) : fmt.DASH);
 				b.active = !!(r && r.rx + r.tx > 50e3);
 				b.rate = r ? r.rx + r.tx : 0;
 			});
@@ -1633,15 +2168,17 @@ return view.extend({
 				var s = ssids[sn.id];
 				if (!s) return;
 				sn.data = s;
-				var tone = s.security.tone === 'open' ? 'unlock' : 'lock';
+				/* a lock only where the security is open or weak */
+				var tone = s.security.tone === 'open' ? 'unlock' : s.security.tone === 'weak' ? 'lock' : null;
 				if (sn.tone !== tone) {
-					var ico = icon(tone, 'vt-ico-sm');
-					if (sn.ico) sn.title.replaceChild(ico, sn.ico); else sn.title.insertBefore(ico, sn.name);
+					var ico = tone ? icon(tone, 'vt-ico-sm') : null;
+					if (sn.ico) sn.title.removeChild(sn.ico);
+					if (ico) sn.title.insertBefore(ico, sn.name);
 					sn.ico = ico;
 					sn.tone = tone;
 				}
 				setClass(sn.el, 'vt-node vt-node-ssid' + (s.clients ? '' : ' vt-node-idle'));
-				setTitle(sn.el, _('Show the clients of %s').format(s.ssid));
+				setTitle(sn.el, _('Show the clients of %s').format(s.ssid) + (tone ? '\n' + s.security.long : ''));
 				txt(sn.name, s.ssid || _('(hidden)'));
 				txt(sn.count, s.clients === 1 ? _('1 client') : _('%d clients').format(s.clients));
 				var dots = m.clients.filter(function(c) { return c.ssidId === s.id; }).slice(0, 8);
@@ -1670,86 +2207,14 @@ return view.extend({
 			setTitle(sn.el, _('Show the devices on %s').format(sn.port) + (r ? '\n' + _('Port total: %s').format('↓ ' + fmt.bits(r.tx) + ' · ↑ ' + fmt.bits(r.rx)) : '') +
 				(sw ? '\n' + switchNote(sw) : ''));
 			txt(sn.name, one ? sn.port + ' · ' + one.name : sn.port);
-			txt(sn.count, one ? (one.speed ? fmt.phyRate(one.speed.mbps * 1000) : fmt.DASH) : on.length === 1 ? _('1 device') : _('%d devices').format(on.length));
-			txt(sn.rate, r ? '↓ ' + fmt.bitsShort(r.tx) + '  ↑ ' + fmt.bitsShort(r.rx) : fmt.DASH);
+			txt(sn.count, one ? (one.speed ? fmt.phyRate(one.speed.mbps * 1000) : fmt.DASH) : _('%d devices').format(on.length));
+			txt(sn.rate, r ? fmt.rates(r.tx, r.rx) : fmt.DASH);
 			sn.active = !!(r && r.rx + r.tx > 50e3);
 		});
 		txt(b.title, n === 1 ? _('1 device') : _('%d devices').format(n));
 		txt(b.sub, seen ? '↓ ' + fmt.bits(tx) : fmt.DASH);
 		b.active = !!(seen && rx + tx > 50e3);
 		b.rate = seen ? rx + tx : 0;
-	},
-
-	/* four numbers under the path: who is here, what flows, where, and
-	   who is worst off. The cells stay; only a change of shape (tone, or
-	   whether a cell links somewhere) rebuilds them. */
-	paintKpis: function() {
-		var self = this, specs = this.m.wired ? this.netKpiSpecs() : this.kpiSpecs();
-		var shape = specs.map(function(k) { return k.tone + (k.act ? '+' : '-'); }).join(' ');
-		this.kpiActs = specs.map(function(k) { return k.act; });
-		if (this.kpiShape !== shape) {
-			this.kpiShape = shape;
-			this.kpiCells = specs.map(function(k, i) {
-				var c = { label: E('span', { 'class': 'vt-kpi-label' }), value: E('span', { 'class': 'vt-kpi-value vt-tn' }), sub: E('span', { 'class': 'vt-kpi-sub' }) };
-				var body = [ c.label, c.value, c.sub ];
-				c.el = k.act
-					? E('button', { 'type': 'button', 'class': 'vt-kpi vt-kpi-' + k.tone, 'click': function() { var f = self.kpiActs[i]; if (f) f(); } }, body)
-					: E('div', { 'class': 'vt-kpi vt-kpi-' + k.tone }, body);
-				return c;
-			});
-			dom.content(this.el.kpis, this.kpiCells.map(function(c) { return c.el; }));
-		}
-		this.kpiCells.forEach(function(c, i) {
-			txt(c.label, specs[i].label);
-			txt(c.value, specs[i].value);
-			txt(c.sub, specs[i].sub);
-		});
-	},
-
-	kpiSpecs: function() {
-		var self = this, m = this.m, st = this.st, up = st.uplinkRate;
-		var byBand = {};
-		m.clients.forEach(function(c) { byBand[c.band] = (byBand[c.band] || 0) + 1; });
-		var bandText = Object.keys(byBand).sort().map(function(b) { return _('%d on %s').format(byBand[b], wifi.bandLabel(b)); }).join(' · ');
-		/* wired hosts downstream count as clients too */
-		var ports = this.wiredPorts(), wiredN = (m.wiredHosts || []).filter(function(c) { return ports.indexOf(c.port) >= 0; }).length;
-		if (wiredN) bandText = [ bandText, _('%d wired').format(wiredN) ].filter(Boolean).join(' · ');
-		var busiest = null;
-		m.radios.forEach(function(r) { var i = st.radioInsights[r.id]; if (i && i.busiest) busiest = { r: r, share: i.share }; });
-		var weakest = m.clients.filter(function(c) { return c.signal != null; }).sort(function(a, b) { return a.signal - b.signal; })[0];
-		return [
-			{ label: _('Clients'), value: String(m.clients.length + wiredN), sub: bandText || _('none connected'), tone: 'plain',
-				act: function() { self.el.clients.scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'start' }); } },
-			{ label: _('Traffic now'), value: up ? '↓ ' + fmt.bits(up.rx) : fmt.DASH, sub: up ? _('↑ %s · via %s').format(fmt.bits(up.tx), m.uplink ? m.uplink.dev : '') : _('measuring'), tone: 'plain',
-				act: function() { self.openDrawer('uplink', 'uplink'); } },
-			busiest ? { label: _('Busiest radio'), value: busiest.r.bandLabel, sub: _('%s of Wi-Fi traffic').format(fmt.pct(busiest.share * 100)), tone: 'plain',
-				act: function() { self.openDrawer('radio', busiest.r.id); } }
-				: { label: _('Busiest radio'), value: fmt.DASH, sub: _('no Wi-Fi traffic yet'), tone: 'plain', act: null },
-			weakest ? { label: _('Weakest signal'), value: fmt.dbm(weakest.signal), sub: weakest.name, tone: weakest.signal < insight.WEAK_DBM ? 'warn' : 'plain',
-				act: function() { self.openDrawer('client', weakest.mac); } }
-				: { label: _('Weakest signal'), value: fmt.DASH, sub: _('no clients'), tone: 'plain', act: null }
-		];
-	},
-
-	/* wired-only: what flows, how long the uplink has held, which
-	   networks are up and which is busiest */
-	netKpiSpecs: function() {
-		var self = this, m = this.m, st = this.st, up = st.uplinkRate, link = m.uplink;
-		var nets = m.networks, upNets = nets.filter(function(n) { return n.up; });
-		var busiest = null;
-		upNets.forEach(function(n) {
-			var r = n.dev ? st.devRates[n.dev] : null;
-			if (r && r.rx + r.tx > 0 && (!busiest || r.rx + r.tx > busiest.r.rx + busiest.r.tx)) busiest = { n: n, r: r };
-		});
-		function toNetwork() { window.location.href = L.url.apply(L, insight.PAGES.network); }
-		function toUplink() { self.openDrawer('uplink', 'uplink'); }
-		return [
-			{ label: _('Traffic now'), value: up ? '↓ ' + fmt.bits(up.rx) : fmt.DASH, sub: up ? _('↑ %s · via %s').format(fmt.bits(up.tx), link ? link.dev : '') : _('measuring'), tone: 'plain', act: toUplink },
-			{ label: _('Connected for'), value: link && link.uptime != null ? fmt.duration(link.uptime) : fmt.DASH, sub: link ? [ link.iface, link.proto ].filter(Boolean).join(' · ') : _('no uplink'), tone: 'plain', act: toUplink },
-			{ label: _('Networks'), value: String(upNets.length), sub: nets.length > upNets.length ? _('%d down').format(nets.length - upNets.length) : _('all up'), tone: 'plain', act: toNetwork },
-			busiest ? { label: _('Busiest network'), value: busiest.n.name, sub: '↓ ' + fmt.bits(busiest.r.tx) + '  ↑ ' + fmt.bits(busiest.r.rx), tone: 'plain', act: toNetwork }
-				: { label: _('Busiest network'), value: fmt.DASH, sub: _('no traffic yet'), tone: 'plain', act: toNetwork }
-		];
 	},
 
 	scheduleWires: function() {
@@ -1763,7 +2228,8 @@ return view.extend({
 	wireList: function() {
 		var h = this.hero, out = [];
 		if (!h) return out;
-		out.push({ key: 'gw', from: h.gw, to: h.ap, active: h.upActive, speed: wires.speed(h.upRate), main: true });
+		out.push({ key: 'gw', from: h.gw, to: h.ap, active: h.upActive, speed: wires.speed(h.upRate), main: true, tunnel: !!(this.m && this.m.uplink && this.m.uplink.tunnel) });
+		h.lines.forEach(function(ln, k) { out.push({ key: 'l:' + ln.id, from: ln.el, to: h.ap, active: ln.active, speed: wires.speed(ln.rate), line: k }); });
 		h.radios.forEach(function(b) {
 			out.push({ key: 'r:' + b.id, from: h.ap, to: b.el, active: b.active, speed: wires.speed(b.rate) });
 			b.ssids.forEach(function(sn) { out.push({ key: 's:' + b.id + ':' + sn.id, from: b.el, to: sn.el, active: sn.active, speed: 1 }); });
@@ -1810,7 +2276,7 @@ return view.extend({
 				svg.appendChild(g.flow);
 				self.el.flows.appendChild(g.fw);
 			}
-			var c = wires.curve(rect(w.from), rect(w.to));
+			var c = w.line != null ? wires.line(rect(w.from), rect(w.to), w.line) : wires.curve(rect(w.from), rect(w.to));
 			if (g.d !== c.d) {
 				g.base.setAttribute('d', c.d);
 				g.flow.setAttribute('d', c.d);
@@ -1839,7 +2305,7 @@ return view.extend({
 		this.wireList().forEach(function(w) {
 			var g = map[w.key];
 			if (!g) return;
-			setClass(g.base, 'vt-wire' + (w.main ? ' vt-wire-main' : '') + (w.active ? ' vt-wire-on' : ''));
+			setClass(g.base, 'vt-wire' + (w.main ? ' vt-wire-main' : '') + (w.tunnel ? ' vt-wire-tunnel' : '') + (w.active ? ' vt-wire-on' : ''));
 			setClass(g.flow, 'vt-flow vt-flow-' + w.speed + (w.active ? ' vt-flow-on' : ''));
 			self.syncFlow(g, !!(w.active && !still && g.d), w.speed);
 		});
@@ -1876,6 +2342,7 @@ return view.extend({
 			/* every dot takes the whole trip, started i/n of the way along */
 			var a = dot.animate(wires.keyframes(g.samples), { duration: dur, delay: -dur * i / n, iterations: Infinity, easing: 'linear' });
 			a.playbackRate = rate;
+			if (this.motionOn === false) a.pause();
 			g.dots.push(dot);
 			g.anims.push(a);
 		}
@@ -1955,6 +2422,7 @@ return view.extend({
 
 		/* memory: one bar, three named segments */
 		var mem = d.memory;
+		el.memBar.hidden = !mem;
 		if (mem) {
 			patch(el.memHead, [
 				E('span', { 'class': 'vt-mem-avail vt-tn' }, [ _('%s available', 'vantage').format(fmt.pct(mem.availPct)) ]),
@@ -1975,7 +2443,13 @@ return view.extend({
 			}));
 		}
 		else {
+			/* nothing left of the last reading, so the next one starts afresh */
 			patch(el.memHead, [ E('span', { 'class': 'vt-muted' }, [ _('Not reported') ]) ]);
+			dom.content(el.memBar, []);
+			el.memBar.removeAttribute('aria-label');
+			el.memSegs = null;
+			el.memPct = null;
+			patch(el.memLegend, []);
 		}
 		if (d.swap) {
 			var sb = E('span', { 'class': 'vt-thin-fill' });
@@ -1995,7 +2469,8 @@ return view.extend({
 		}).concat(d.storage.length ? [] : [ E('span', { 'class': 'vt-muted' }, [ _('Not reported') ]) ]));
 		patch(el.fw, [
 			E('span', {}, [ d.firmware || '' ]),
-			d.kernel ? E('span', { 'class': 'vt-hint' }, [ _('Kernel %s').format(d.kernel) ]) : ''
+			d.kernel ? E('span', { 'class': 'vt-hint' }, [ _('Kernel %s').format(d.kernel) ]) : '',
+			E('span', { 'class': 'vt-hint' }, [ 'Vantage ' + VERSION ])
 		]);
 	},
 
@@ -2033,7 +2508,8 @@ return view.extend({
 		]));
 	},
 
-	/* one small multiple per link: the uplink, then each radio, each with
+	/* one small multiple per link: the uplink, the other lines to the
+	   internet, then each radio, each with
 	   its own y scale (a busy uplink would flatten an idle radio), on a
 	   shared time axis and crosshair. Download (towards the clients) and
 	   upload each keep their direction's colour; how they share the plot
@@ -2042,7 +2518,8 @@ return view.extend({
 	   download, a radio sends it. */
 	chartSeries: function() {
 		var m = this.m;
-		var list = [ { key: 'uplink', label: m.uplink ? _('Uplink %s').format(m.uplink.dev) : _('Uplink', 'vantage'), dn: 1, up: 2 } ];
+		var list = [ { key: m.uplink ? lineKey(m.uplink) : 'uplink', label: m.uplink ? _('Uplink %s').format(m.uplink.dev) : _('Uplink', 'vantage'), dn: 1, up: 2 } ];
+		this.extraLines().forEach(function(x) { list.push({ key: lineKey(x), label: _('Uplink %s').format(x.dev), dn: 1, up: 2 }); });
 		m.radios.forEach(function(r) { list.push({ key: r.id, label: _('%s radio').format(r.bandLabel), dn: 2, up: 1 }); });
 		return list;
 	},
@@ -2054,7 +2531,14 @@ return view.extend({
 		   can run ahead of the browser's: the axis ends at the newest one */
 		list.forEach(function(s) { var h = net[s.key]; if (h && h.length) now = Math.max(now, h[h.length - 1][0]); });
 
-		var dm = series.domain(list.map(function(s) { return net[s.key]; }), now, 60000, WINDOW_MS);
+		/* always the full five minutes: while history collects, the lines
+		   start part way across and the minute labels stay where they are
+		   (a span that grew with the history moved them every poll, #71) */
+		var dm = series.domain(list.map(function(s) { return net[s.key]; }), now, WINDOW_MS, WINDOW_MS);
+		/* history keeps only samples newer than the window, so its oldest is
+		   up to one poll short of five minutes: allow two polls, or the
+		   subtitle flips to "collecting" with a full history */
+		dm.full = dm.age >= WINDOW_MS - POLL_S * 2000;
 		var ticks = [];
 		for (var k = 1; k * 60000 < dm.span - 20000; k++) ticks.push(k);
 		var rows = [], samples = 0;
@@ -2064,7 +2548,7 @@ return view.extend({
 			var d = (net[s.key] || []).filter(function(p) { return p[0] >= dm.t0 - POLL_S * 1000; });
 			var sd = series.stats(d, s.dn, dm.t0), su = series.stats(d, s.up, dm.t0);
 			var last = d.length ? d[d.length - 1] : null, fresh = !!(last && now - last[0] < POLL_S * 3000);
-			var g = series.chartGeom(style, sd.peak, su.peak);
+			var g = series.chartGeom(style, sd.peak, su.peak), pk = fmt.rateParts(sd.peak, su.peak);
 			samples = Math.max(samples, sd.n);
 
 			var svg = svgRoot('vt-mult-svg', '0 0 ' + W + ' ' + H);
@@ -2113,7 +2597,10 @@ return view.extend({
 					E('span', { 'class': 'vt-mult-now vt-mult-now-up', 'title': _('Upload') }, [ dirKey('up'),
 						E('b', { 'class': 'vt-tn' }, [ dirArrow('up'), ' ', fresh && su.now != null ? fmt.bits(last[s.up]) : fmt.DASH ]) ]),
 					E('span', { 'class': 'vt-mult-stats vt-tn' }, sd.n > 1 ? [
-						E('span', {}, [ _('peak', 'vantage'), ' ', E('b', {}, [ dirArrow('dn'), ' ' + fmt.bitsShort(sd.peak) ]), ' ', E('b', {}, [ dirArrow('up'), ' ' + fmt.bitsShort(su.peak) ]) ])
+						/* each direction its own item, so they wrap in the narrow readout column */
+						/* the shared unit on both, so a wrapped line keeps its own */
+						E('span', {}, [ _('peak', 'vantage'), ' ', E('b', {}, [ dirArrow('dn'), ' ' + pk.dn ]), pk.unit ? ' ' + pk.unit : '' ]),
+						E('span', {}, [ E('b', {}, [ dirArrow('up'), ' ' + pk.up ]), pk.unit ? ' ' + pk.unit : '' ])
 					] : [ E('span', {}, [ _('measuring…') ]) ])
 				]),
 				E('div', { 'class': 'vt-mult-plot vt-chart-' + style }, [
@@ -2140,7 +2627,6 @@ return view.extend({
 		var age = dm.age;
 		txt(el.chartSub, dm.full ? _('last 5 min')
 			: samples < 2 ? _('collecting · first samples') : _('collecting · %s of data').format(spanShort(age)));
-		el.plot.classList.toggle('vt-collecting', !dm.full);
 		if (this.ui.hover) this.chartShow(this.ui.hover);
 	},
 
@@ -2269,7 +2755,7 @@ return view.extend({
 			}
 			var hist = st.hist.net[r.id] || [];
 			var clients = m.clients.filter(function(c) { return c.radio === r.id; });
-			return E('article', { 'class': 'vt-tile vt-radio vt-radio-' + (r.band || 'x') + (r.up ? '' : ' vt-radio-off') + (ins.busiest ? ' vt-radio-busiest' : ''), 'data-radio': r.id }, [
+			return E('article', { 'class': 'vt-tile vt-radio vt-radio-' + (r.band || 'x') + (r.up ? '' : ' vt-radio-off'), 'data-radio': r.id }, [
 				E('header', { 'class': 'vt-radio-head' }, [
 					bandBadge(r.band),
 					E('span', { 'class': 'vt-radio-name' }, [ r.gen || r.id ]),
@@ -2282,11 +2768,12 @@ return view.extend({
 					E('span', { 'class': 'vt-radio-width vt-tn' }, [ r.width ? _('%s MHz').format(r.width) : '', r.auto ? ' · ' + _('auto') : '' ])
 				]),
 				spec,
+				/* noise and airtime only where the driver reports them */
 				E('dl', { 'class': 'vt-stats' }, [
 					kv(_('Clients'), E('span', { 'class': 'vt-tn' }, [ String(r.clients) ])),
 					kv(_('Tx power'), E('span', { 'class': 'vt-tn' }, [ r.txpower != null ? _('%s dBm').format(r.txpower) : fmt.DASH ])),
-					kv(_('Noise'), r.noise != null ? E('span', { 'class': 'vt-tn' }, [ fmt.dbm(r.noise) ]) : E('span', { 'class': 'vt-muted', 'title': _('The driver reports a placeholder value, so no noise floor or SNR is shown') }, [ _('not reported') ])),
-					kv(_('Airtime'), r.airtime != null ? E('span', { 'class': 'vt-tn' }, [ fmt.pct(r.airtime) ]) : E('span', { 'class': 'vt-muted' }, [ _('not reported') ]))
+					r.noise != null ? kv(_('Noise'), E('span', { 'class': 'vt-tn' }, [ fmt.dbm(r.noise) ])) : '',
+					r.airtime != null ? kv(_('Airtime'), E('span', { 'class': 'vt-tn' }, [ fmt.pct(r.airtime) ])) : ''
 				]),
 				E('div', { 'class': 'vt-radio-live' }, [
 					rateLine(rr ? rr.tx : null, rr ? rr.rx : null),
@@ -2309,13 +2796,13 @@ return view.extend({
 		var self = this, el = this.el, ui = this.ui;
 		el.filter = E('input', { 'type': 'text', 'class': 'vt-filter-input', 'placeholder': _('Filter by name, address, SSID…'),
 			'aria-label': _('Filter clients'), 'autocomplete': 'off', 'spellcheck': 'false',
-			'input': function(ev) { self.ui.filter = ev.target.value; self.paintClients(); } });
+			'input': function(ev) { self.ui.filter = ev.target.value; self.pickClients(); } });
 		el.filterClear = E('button', { 'type': 'button', 'class': 'vt-filter-clear', 'aria-label': _('Clear filter', 'vantage'), 'hidden': 'hidden',
 			'click': function() { self.setFilter(''); el.filter.focus(); } }, [ icon('close') ]);
 		/* the quick filters sit in a menu at the end of the search box; the
 		   one in force shows as a tag in the box, so none is ever hidden */
 		el.filterTag = E('button', { 'type': 'button', 'class': 'vt-ftag', 'hidden': 'hidden',
-			'click': function(ev) { ev.preventDefault(); ui.chip = 'all'; self.paintClients(); el.filter.focus(); } });
+			'click': function(ev) { ev.preventDefault(); ui.chip = 'all'; self.pickClients(); el.filter.focus(); } });
 		el.filterBtn = E('button', { 'type': 'button', 'class': 'vt-filter-btn', 'aria-haspopup': 'true', 'aria-expanded': 'false',
 			'aria-label': _('Quick filters'), 'title': _('Quick filters'),
 			'click': function(ev) { ev.preventDefault(); self.filterMenu(); } }, [ icon('filter') ]);
@@ -2372,7 +2859,16 @@ return view.extend({
 	setFilter: function(v) {
 		this.ui.filter = v;
 		this.el.filter.value = v;
+		this.pickClients();
+	},
+
+	/* the viewer changed what the Clients tile lists (filter, quick
+	   filter, Wi-Fi or wired): its new height at once. The hold that
+	   keeps the page still is for polls, not for a pick */
+	pickClients: function() {
+		if (this.held) delete this.held.clients;
 		this.paintClients();
+		this.scheduleLayout();
 	},
 
 	filterSsid: function(ssid, band) {
@@ -2472,7 +2968,7 @@ return view.extend({
 		dom.content(el.filterMenu, defs.map(function(d) {
 			var sel = ui.chip === d[0];
 			return E('button', { 'type': 'button', 'role': 'menuitemradio', 'aria-checked': String(sel), 'class': 'vt-fmenu-item' + (d[3] && d[2] ? ' vt-fmenu-warn' : ''),
-				'click': function() { ui.chip = d[0]; self.filterMenu(false); self.paintClients(); el.filterBtn.focus(); } }, [
+				'click': function() { ui.chip = d[0]; self.filterMenu(false); self.pickClients(); el.filterBtn.focus(); } }, [
 				E('span', { 'class': 'vt-fmenu-check', 'aria-hidden': 'true' }, [ sel ? icon('check') : '' ]),
 				E('span', { 'class': 'vt-fmenu-label' }, [ d[1] ]),
 				E('span', { 'class': 'vt-fmenu-n vt-tn' }, [ String(d[2]) ])
@@ -2494,7 +2990,7 @@ return view.extend({
 			this.kindSig = kindSig;
 			dom.content(el.kinds, !both ? [] : [ [ 'wifi', _('Wi-Fi'), m.clients.length ], [ 'wired', _('Wired'), hosts.length ] ].map(function(k) {
 				return E('button', { 'type': 'button', 'class': 'vt-kind' + (ui.kind === k[0] ? ' vt-kind-on' : ''), 'aria-pressed': String(ui.kind === k[0]),
-					'click': function() { if (ui.kind !== k[0]) { ui.kind = k[0]; ui.chip = 'all'; self.paintClients(); } } }, [
+					'click': function() { if (ui.kind !== k[0]) { ui.kind = k[0]; ui.chip = 'all'; self.pickClients(); } } }, [
 					E('span', {}, [ k[1] ]), E('span', { 'class': 'vt-kind-n vt-tn' }, [ String(k[2]) ])
 				]);
 			}));
@@ -2596,14 +3092,18 @@ return view.extend({
 	},
 
 	/* the device cell of a client row: avatar, name, where the name comes
-	   from, tags and the address */
+	   from, tags and the address. A name made up from the address
+	   ("Private device 53:0F") says where it comes from itself, and
+	   drops the octets when the second line is the MAC */
 	whoCell: function(c, tags) {
+		var made = madeName(c), label = made && c.secondary === c.macLabel ? c.plainName : c.name;
 		return E('td', { 'class': 'vt-td-name', 'data-title': _('Device') }, [
 			E('div', { 'class': 'vt-who' }, [
 				avatar(c),
 				E('div', { 'class': 'vt-who-text' }, [
-					E('div', { 'class': 'vt-who-label', 'title': c.name }, [ c.name ]),
-					E('div', { 'class': 'vt-who-sub' }, [ E('span', { 'class': 'vt-src vt-src-' + c.nameSource, 'title': _('Name from: %s').format(this.sourceText(c)) }, [ c.nameSourceLabel ]) ].concat(tags, [ E('span', { 'class': 'vt-mono vt-who-id' }, [ c.secondary ]) ]))
+					E('div', { 'class': 'vt-who-label', 'title': label }, [ label ]),
+					E('div', { 'class': 'vt-who-sub' }, (made ? [] : [ E('span', { 'class': 'vt-src vt-src-' + c.nameSource, 'title': _('Name from: %s').format(this.sourceText(c)) }, [ c.nameSourceLabel ]) ])
+						.concat(tags, [ E('span', { 'class': 'vt-mono vt-who-id' }, [ c.secondary ]) ]))
 				])
 			])
 		]);
@@ -2617,9 +3117,8 @@ return view.extend({
 		var bar = E('span', { 'class': 'vt-mini-fill' });
 		setW(bar, maxRate > 0 ? total / maxRate * 100 : 0);
 		var tags = [];
-		var up = this.m && this.m.uplink;
 		if (c.gateway) tags.push(pill(_('Gateway'), 'accent', _('The router this device sends its traffic to')));
-		else if (up && up.port && c.port === up.port) tags.push(pill(_('Upstream'), 'muted', _('Reached through the uplink port %s, not connected to this device').format(c.port)));
+		else if (this.linePort(c.port)) tags.push(pill(_('Upstream'), 'muted', _('Reached through the uplink port %s, not connected to this device').format(c.port)));
 		if (c.vlan != null) tags.push(pill(_('VLAN %d').format(c.vlan), 'muted'));
 		var speed = c.speed ? fmt.phyRate(c.speed.mbps * 1000) : fmt.DASH;
 		var link = E('td', { 'class': 'vt-td-link', 'data-title': _('Link', 'vantage') }, [
@@ -2639,7 +3138,7 @@ return view.extend({
 				E('div', { 'class': 'vt-live-cell' }, [
 					E('span', { 'class': 'vt-tn vt-live-total' }, [ r ? fmt.bits(total) : fmt.DASH ]),
 					E('span', { 'class': 'vt-mini' }, [ bar ]),
-					E('span', { 'class': 'vt-live-split vt-tn', 'title': r ? _('To device %s, from device %s').format(fmt.bits(r.tx), fmt.bits(r.rx)) : '' }, [ r ? '↓ ' + fmt.bitsShort(r.tx) + '  ↑ ' + fmt.bitsShort(r.rx) : '' ])
+					E('span', { 'class': 'vt-live-split vt-tn', 'title': r ? _('To device %s, from device %s').format(fmt.bits(r.tx), fmt.bits(r.rx)) : '' }, [ r ? fmt.rates(r.tx, r.rx) : '' ])
 				])
 			]),
 			E('td', { 'class': 'vt-td-seen vt-tn', 'data-title': _('Last heard') }, [ c.seen == null ? _('static entry') : fmt.ago(c.seen * 1000) ])
@@ -2674,7 +3173,7 @@ return view.extend({
 				E('div', { 'class': 'vt-live-cell' }, [
 					E('span', { 'class': 'vt-tn vt-live-total' }, [ r ? fmt.bits(total) : fmt.DASH ]),
 					E('span', { 'class': 'vt-mini' }, [ bar ]),
-					E('span', { 'class': 'vt-live-split vt-tn', 'title': r ? _('To device %s, from device %s').format(fmt.bits(r.tx), fmt.bits(r.rx)) : '' }, [ r ? '↓ ' + fmt.bitsShort(r.tx) + '  ↑ ' + fmt.bitsShort(r.rx) : '' ])
+					E('span', { 'class': 'vt-live-split vt-tn', 'title': r ? _('To device %s, from device %s').format(fmt.bits(r.tx), fmt.bits(r.rx)) : '' }, [ r ? fmt.rates(r.tx, r.rx) : '' ])
 				])
 			]),
 			E('td', { 'class': 'vt-td-exp', 'data-title': _('Experience') }, c.gone ? [ E('span', { 'class': 'vt-muted' }, [ fmt.DASH ]) ] : [
@@ -2692,7 +3191,7 @@ return view.extend({
 	buildTalkers: function() {
 		this.el.talkers = E('div', { 'class': 'vt-talkers' });
 		return E('section', { 'class': 'vt-tile vt-talk', 'aria-label': _('Top talkers', 'vantage') }, [
-			tileHead('pulse', _('Top talkers', 'vantage'), [ E('span', { 'class': 'vt-hint' }, [ _('who uses the bandwidth') ]) ]),
+			tileHead('pulse', _('Top talkers', 'vantage')),
 			this.el.talkers
 		]);
 	},
@@ -2728,7 +3227,7 @@ return view.extend({
 					E('span', { 'class': 'vt-talk-top' }, [ E('span', { 'class': 'vt-talk-name', 'title': c.name }, [ c.name ]) ]),
 					E('span', { 'class': 'vt-talk-bar' }, [ fill ]),
 					E('span', { 'class': 'vt-talk-sub vt-tn', 'title': _('To device %s, from device %s').format(fmt.bits(x.down), fmt.bits(x.up)) }, [
-						E('b', {}, [ fmt.bits(x.total) ]), E('span', { 'class': 'vt-talk-share' }, [ fmt.pct(x.share * 100) ]), '↓ ' + fmt.bitsShort(x.down) + '  ↑ ' + fmt.bitsShort(x.up) ])
+						E('b', {}, [ fmt.bits(x.total) ]), E('span', { 'class': 'vt-talk-share' }, [ fmt.pct(x.share * 100) ]), fmt.rates(x.down, x.up) ])
 				])
 			]);
 		}).concat(slots));
@@ -2755,12 +3254,13 @@ return view.extend({
 			var rx = 0, tx = 0, has = false;
 			g.ids.forEach(function(id) { var r = st.ssidRates[id]; if (r) { rx += r.rx; tx += r.tx; has = true; } });
 			var bands = g.bands.map(function(b) { return bandBadge(b); });
+			/* a lock, in amber, only where the security is open or weak */
+			var tone = g.security.tone === 'open' ? 'unlock' : g.security.tone === 'weak' ? 'lock' : null;
 			return E('button', { 'type': 'button', 'class': 'vt-ssid' + (g.clients ? '' : ' vt-ssid-idle'), 'title': _('Show the clients of %s').format(g.ssid),
 				'click': function() { self.filterSsid(g.ssid); } }, [
-				E('span', { 'class': 'vt-ssid-ico' + (g.security.tone === 'open' || g.security.tone === 'weak' ? ' vt-t-warn' : '') }, [ icon(g.security.tone === 'open' ? 'unlock' : 'lock') ]),
 				E('span', { 'class': 'vt-ssid-main' }, [
 					E('span', { 'class': 'vt-ssid-top' }, [ E('span', { 'class': 'vt-ssid-name' }, [ g.ssid || _('(hidden)') ]), g.hidden ? pill(_('Hidden', 'vantage'), 'muted') : '' ]),
-					E('span', { 'class': 'vt-ssid-meta' }, bands.concat([ E('span', { 'class': 'vt-sec', 'title': g.security.long }, [ g.security.short ]) ]))
+					E('span', { 'class': 'vt-ssid-meta' }, bands.concat([ E('span', { 'class': 'vt-sec' + (tone ? ' vt-t-warn' : ''), 'title': g.security.long }, [ tone ? icon(tone, 'vt-ico-sm') : '', g.security.short ]) ]))
 				]),
 				E('span', { 'class': 'vt-ssid-side' }, [
 					E('span', { 'class': 'vt-ssid-n vt-tn' }, [ String(g.clients) ]),
@@ -2790,13 +3290,15 @@ return view.extend({
 		var el = this.el;
 		this.ui.drawer = { kind: kind, id: id };
 		this.ui.editing = null;
+		/* the address names what is shown, also when the open drawer
+		   moves on (from a radio to one of its clients) */
+		try { history.replaceState(null, '', '#' + kind + (kind === 'uplink' && !id ? '' : '=' + encodeURIComponent(id))); } catch (e) {}
 		if (!el.drawer.hidden) { this.paintDrawer(); this.paintClients(); return; }
 		this.lastFocus = document.activeElement;
 		el.drawer.hidden = false;
 		el.drawerBack.hidden = false;
 		this.paintDrawer();
 		this.paintClients();
-		try { history.replaceState(null, '', '#' + kind + '=' + encodeURIComponent(id)); } catch (e) {}
 		window.requestAnimationFrame(function() { el.root.classList.add('vt-drawer-open'); el.drawerClose.focus(); });
 	},
 
@@ -2813,16 +3315,19 @@ return view.extend({
 	},
 
 	/* A deep link names an existing thing or nothing: a client by a
-	   station MAC, a radio this device reports; uplink and device take no
-	   id. Anything else is dropped from the address bar, so a crafted link
-	   cannot put its own text in the drawer title. */
+	   station MAC, a radio this device reports, a line to the internet by
+	   its interface (#uplink alone: the main one, whichever it is); the
+	   device takes no id. Anything else is dropped from the address bar,
+	   so a crafted link cannot put its own text in the drawer title. */
 	openFromHash: function() {
 		var hash = location.hash || '', m = /^#(client|radio|uplink|device)=(.{1,128})$/.exec(hash), id = null;
+		if (hash === '#uplink') { this.openDrawer('uplink', ''); return; }
 		if (m) {
 			try { id = decodeURIComponent(m[2]); } catch (e) { id = null; }
 			if (id == null) { /* malformed escape */ }
 			else if (m[1] === 'client') id = names.normMac(id);
 			else if (m[1] === 'radio') id = this.m && this.m.radios.some(function(r) { return r.id === id; }) ? id : null;
+			else if (m[1] === 'uplink') id = ((this.m && this.m.uplinks) || []).some(function(x) { return x.iface === id; }) ? id : '';
 			else id = m[1];
 		}
 		if (id != null) { this.openDrawer(m[1], id); return; }
@@ -2838,7 +3343,7 @@ return view.extend({
 		var content;
 		if (d.kind === 'client') content = this.drawerClient(d.id);
 		else if (d.kind === 'radio') content = this.drawerRadio(d.id);
-		else if (d.kind === 'uplink') content = this.drawerUplink();
+		else if (d.kind === 'uplink') content = this.drawerUplink(d.id);
 		else content = this.drawerDevice();
 		dom.content(el.drawerTitle, content.title);
 		dom.content(el.drawerBody, content.body);
@@ -2846,6 +3351,22 @@ return view.extend({
 
 	section: function(title, children, cls) {
 		return E('section', { 'class': 'vt-dsec' + (cls ? ' ' + cls : '') }, [ E('h4', { 'class': 'vt-dsec-title' }, [ title ]) ].concat(children));
+	},
+
+	/* a client's drawer title: its name, where the name comes from and
+	   its address; a name made up from the MAC shows the MAC instead */
+	drawerWho: function(c) {
+		var made = madeName(c);
+		return [
+			avatar(c),
+			E('div', { 'class': 'vt-drawer-titles' }, [
+				E('div', { 'class': 'vt-drawer-name', 'id': 'vt-drawer-name' }, [ made ? c.plainName : c.name ]),
+				E('div', { 'class': 'vt-drawer-sub' }, made ? [ E('span', { 'class': 'vt-mono' }, [ c.macLabel ]) ] : [
+					E('span', { 'class': 'vt-src vt-src-' + c.nameSource }, [ c.nameSourceLabel ]),
+					E('span', { 'class': 'vt-mono' }, [ c.secondary ])
+				])
+			])
+		];
 	},
 
 	drawerClient: function(mac) {
@@ -2864,16 +3385,7 @@ return view.extend({
 		var exp = c.exp || insight.experience(c);
 		var radio = this.m.radios.filter(function(x) { return x.id === c.radio; })[0];
 
-		var title = [
-			avatar(c),
-			E('div', { 'class': 'vt-drawer-titles' }, [
-				E('div', { 'class': 'vt-drawer-name', 'id': 'vt-drawer-name' }, [ c.name ]),
-				E('div', { 'class': 'vt-drawer-sub' }, [
-					E('span', { 'class': 'vt-src vt-src-' + c.nameSource }, [ c.nameSourceLabel ]),
-					E('span', { 'class': 'vt-mono' }, [ c.secondary ])
-				])
-			])
-		];
+		var title = this.drawerWho(c);
 
 		var rename = this.canWrite ? E('button', { 'type': 'button', 'class': 'vt-btn vt-btn-ghost', 'click': function() { self.startRename(c); } }, [ icon('pencil'), E('span', {}, [ c.alias ? _('Rename', 'vantage') : _('Name this device') ]) ]) : '';
 		var sigSeries = hist.map(function(p) { return [ p[0], p[1] ]; }).filter(function(p) { return isFinite(p[1]); });
@@ -2888,7 +3400,7 @@ return view.extend({
 			E('div', { 'class': 'vt-dactions' }, [ rename, pageLink(insight.PAGES.wireless, _('Wireless settings')) ]),
 			this.el.renameSlot = E('div', { 'class': 'vt-rename-slot' }),
 			c.gone ? '' : E('div', { 'class': 'vt-expcard vt-expcard-' + exp.level }, [
-				E('div', { 'class': 'vt-ring vt-tn' }, [ this.ring(exp.score, exp.level), E('span', { 'class': 'vt-ring-n' }, [ String(exp.score) ]) ]),
+				E('div', { 'class': 'vt-ring vt-tn' }, [ this.ring(exp.score), E('span', { 'class': 'vt-ring-n' }, [ String(exp.score) ]) ]),
 				E('div', { 'class': 'vt-expcard-text' }, [
 					E('div', { 'class': 'vt-expcard-grade' }, [ _('%s experience').format(exp.grade) ]),
 					E('div', { 'class': 'vt-expcard-reason' }, [ exp.reason ]),
@@ -2922,19 +3434,19 @@ return view.extend({
 				kv(_('Network'), [ c.ssid, ' ', bandBadge(c.band) ]),
 				kv(_('Radio', 'vantage'), radio ? _('%s · channel %d · %d MHz').format(radio.id, radio.channel || 0, radio.width || 20) : c.radio),
 				kv(_('Connected for'), c.gone ? fmt.DASH : fmt.duration(c.connected)),
-				kv(_('Last activity', 'vantage'), c.inactive == null || c.gone ? fmt.DASH : c.inactive < 1000 ? _('now', 'vantage') : _('%s ago', 'vantage').format(fmt.duration(c.inactive / 1000))),
+				kv(_('Last activity', 'vantage'), c.inactive == null || c.gone ? fmt.DASH : fmt.ago(c.inactive)),
 				kv(_('Seen since'), c.firstSeen ? (c.isNew ? _('%s (new this session)').format(new Date(c.firstSeen).toLocaleTimeString()) : _('before this page opened')) : fmt.DASH)
 			]) ]),
 			this.section(_('Traffic'), [ E('dl', { 'class': 'vt-kvs' }, [
 				kv(_('Downloaded', 'vantage'), fmt.bytes(c.txBytes)),
 				kv(_('Uploaded', 'vantage'), fmt.bytes(c.rxBytes)),
-				kv(_('Frames to device'), c.txPackets ? _('%d sent · %s retried · %s failed').format(c.txPackets, fmt.pct(c.txRetries / Math.max(1, c.txPackets) * 100, 1), fmt.pct(c.txFailed / Math.max(1, c.txPackets + c.txFailed) * 100, 1)) : fmt.DASH)
+				kv(_('Frames to device'), c.txPackets ? _('%s sent · %s retried · %s failed').format(fmt.count(c.txPackets), fmt.pct(c.txRetries / Math.max(1, c.txPackets) * 100, 1), fmt.pct(c.txFailed / Math.max(1, c.txPackets + c.txFailed) * 100, 1)) : fmt.DASH)
 			]) ]),
 			this.section(_('Identity'), [ E('dl', { 'class': 'vt-kvs' }, [
 				kv(_('MAC address'), c.macLabel, true),
 				kv(_('Address type'), c.isPrivate ? _('Private Wi-Fi address (randomised by the device)') : (c.vendor ? _('Globally unique · %s').format(c.vendor) : _('Globally unique'))),
 				kv(_('IP addresses'), c.ips && c.ips.length ? c.ips.join('\n') : E('span', { 'class': 'vt-muted' }, [ _('not known to this AP') ]), true),
-				kv(_('Name from'), this.sourceText(c)),
+				madeName(c) ? '' : kv(_('Name from'), this.sourceText(c)),
 				c.wps && c.nameSource !== 'wps' ? kv(_('WPS device name'), c.wps) : ''
 			]) ])
 		];
@@ -2943,16 +3455,7 @@ return view.extend({
 
 	drawerWired: function(c) {
 		var self = this, r = this.portRate(c), shared = c.shared ? this.st.devRates[c.port] : null;
-		var title = [
-			avatar(c),
-			E('div', { 'class': 'vt-drawer-titles' }, [
-				E('div', { 'class': 'vt-drawer-name', 'id': 'vt-drawer-name' }, [ c.name ]),
-				E('div', { 'class': 'vt-drawer-sub' }, [
-					E('span', { 'class': 'vt-src vt-src-' + c.nameSource }, [ c.nameSourceLabel ]),
-					E('span', { 'class': 'vt-mono' }, [ c.secondary ])
-				])
-			])
-		];
+		var title = this.drawerWho(c);
 		var rename = this.canWrite ? E('button', { 'type': 'button', 'class': 'vt-btn vt-btn-ghost', 'click': function() { self.startRename(c); } }, [ icon('pencil'), E('span', {}, [ c.alias ? _('Rename', 'vantage') : _('Name this device') ]) ]) : '';
 		var speed = c.speed ? model.speedLabel(c.speed) : fmt.DASH;
 		var body = [
@@ -2975,7 +3478,7 @@ return view.extend({
 				kv(_('MAC address'), c.macLabel, true),
 				kv(_('Address type'), c.isPrivate ? _('Private address (randomised by the device)') : (c.vendor ? _('Globally unique · %s').format(c.vendor) : _('Globally unique'))),
 				kv(_('IP addresses'), c.ips && c.ips.length ? c.ips.join('\n') : E('span', { 'class': 'vt-muted' }, [ _('not known to this device') ]), true),
-				kv(_('Name from'), this.sourceText(c))
+				madeName(c) ? '' : kv(_('Name from'), this.sourceText(c))
 			]) ])
 		];
 		return { title: title, body: body };
@@ -2988,14 +3491,12 @@ return view.extend({
 		case 'mdns': return _('mDNS announcement');
 		case 'dhcp': return _('DHCP hostname');
 		case 'wps': return _('The name the device announces (WPS)');
-		case 'vendor': return _('Manufacturer of the network adapter');
-		case 'private': return _('Nothing better known; the address is randomised');
 		}
 		return _('Nothing better known');
 	},
 
-	ring: function(score, level) {
-		var s = svgRoot('vt-ring-svg vt-lvlc-' + level, '0 0 36 36');
+	ring: function(score) {
+		var s = svgRoot('vt-ring-svg', '0 0 36 36');
 		var c = 2 * Math.PI * 15.5, f = Math.max(0, Math.min(100, score)) / 100 * c;
 		var track = document.createElementNS(SVGNS, 'circle');
 		track.setAttribute('cx', '18'); track.setAttribute('cy', '18'); track.setAttribute('r', '15.5');
@@ -3114,7 +3615,9 @@ return view.extend({
 					kv(_('Mode'), [ r.htmode || fmt.DASH, r.hwmodes ? E('small', {}, [ r.hwmodes ]) : '' ]),
 					kv(_('Centre frequency'), r.spectrum ? _('%d MHz (%d–%d MHz)').format(r.spectrum.centre, r.spectrum.lo, r.spectrum.hi) : fmt.DASH),
 					kv(_('Tx power'), r.txpower != null ? _('%s dBm').format(r.txpower) + (r.txpowerCfg != null && r.txpowerCfg !== r.txpower ? ' ' + _('(configured %d dBm, limited by regulatory rules)').format(r.txpowerCfg) : '') : fmt.DASH),
-					kv(_('Noise floor'), r.noise != null ? fmt.dbm(r.noise) : E('span', { 'class': 'vt-muted' }, [ r.noiseRaw != null ? _('not reported (driver placeholder %s)').format(fmt.dbm(r.noiseRaw)) : _('not reported') ])),
+					/* a placeholder from the driver says why there is none */
+					r.noise != null ? kv(_('Noise floor'), fmt.dbm(r.noise))
+						: r.noiseRaw != null ? kv(_('Noise floor'), E('span', { 'class': 'vt-muted' }, [ _('not reported (driver placeholder %s)').format(fmt.dbm(r.noiseRaw)) ])) : '',
 					kv(_('Country'), r.country || fmt.DASH)
 				]) ]),
 				this.section(_('Clients on this radio'), clients.length ? [ E('div', { 'class': 'vt-dlist' }, clients.map(function(c) {
@@ -3122,13 +3625,31 @@ return view.extend({
 						avatar(c, true), E('span', { 'class': 'vt-dlist-name' }, [ c.name ]),
 						E('span', { 'class': 'vt-signal' }, [ signalGlyph(c.level), E('span', { 'class': 'vt-tn' }, [ fmt.dbm(c.signal) ]) ])
 					]);
-				})) ] : [ E('p', { 'class': 'vt-empty-inline' }, [ _('No clients; an idle radio is fine.') ]) ])
+				})) ] : [ E('p', { 'class': 'vt-empty-inline' }, [ _('No clients connected') ]) ])
 			]
 		};
 	},
 
-	drawerUplink: function() {
-		var up = this.m.uplink, r = this.st.uplinkRate;
+	/* the main line (id ''), whichever interface it is, or one line by
+	   its interface: still that one after a failover makes it the main
+	   line, and said to be down when it is no line any more (never
+	   another interface under its name) */
+	drawerUplink: function(id) {
+		var m = this.m, st = this.st, lines = m.uplinks || [];
+		var up = id ? lines.filter(function(x) { return x.iface === id; })[0] : m.uplink;
+		var r = up && up === m.uplink ? st.uplinkRate : up ? st.devRates[up.statsDev] || null : null;
+		var hist = up ? st.hist.net[lineKey(up)] : null, several = lines.length > 1;
+		var tunR = up && up.tunnel ? st.devRates[up.tunnel.dev] || null : null;
+		function errors(n) { return fmt.N_(n, '%s error', '%s errors').format(fmt.count(n)); }
+		if (id && !up) return {
+			title: [ E('span', { 'class': 'vt-drawer-ico' }, [ icon('globe') ]), E('div', { 'class': 'vt-drawer-titles' }, [
+				E('div', { 'class': 'vt-drawer-name' }, [ _('Uplink · %s').format(id) ])
+			]) ],
+			body: [
+				E('div', { 'class': 'vt-dactions' }, [ pageLink(insight.PAGES.network, _('Interfaces')) ]),
+				E('p', { 'class': 'vt-empty-inline' }, [ _('This line is down or has no default route now.') ])
+			]
+		};
 		if (!up) return { title: [ E('span', { 'class': 'vt-drawer-name' }, [ _('Uplink', 'vantage') ]) ], body: [ E('p', { 'class': 'vt-empty-inline' }, [ _('No interface with a route is up.') ]) ] };
 		var s = up.stats || {};
 		return {
@@ -3142,23 +3663,28 @@ return view.extend({
 					E('div', { 'class': 'vt-dcard' }, [ E('div', { 'class': 'vt-dcard-label' }, [ _('From network') ]), E('div', { 'class': 'vt-dcard-value' }, [ r ? fmt.bits(r.rx) : fmt.DASH ]), E('div', { 'class': 'vt-dcard-sub' }, [ _('received on %s').format(up.dev) ]) ]),
 					E('div', { 'class': 'vt-dcard' }, [ E('div', { 'class': 'vt-dcard-label' }, [ _('To network') ]), E('div', { 'class': 'vt-dcard-value' }, [ r ? fmt.bits(r.tx) : fmt.DASH ]), E('div', { 'class': 'vt-dcard-sub' }, [ _('sent on %s').format(up.dev) ]) ])
 				]),
-				E('div', { 'class': 'vt-dspark' }, [ sparkline(this.st.hist.net.uplink || [], [ 1, 2 ], 0, 'vt-spark-up', { min: 1000, scale: bitsLabel }) ]),
+				E('div', { 'class': 'vt-dspark' }, [ sparkline(hist || [], [ 1, 2 ], 0, 'vt-spark-up', { min: 1000, scale: bitsLabel }) ]),
 				this.section(_('Link', 'vantage'), [ E('dl', { 'class': 'vt-kvs' }, [
 					kv(_('Carrier'), up.carrier === false ? _('No link') : _('Up', 'vantage')),
 					kv(_('Speed', 'vantage'), model.speedLabel(up.speed)),
 					kv(_('Protocol'), up.proto || fmt.DASH),
-					kv(_('Interface up for'), up.uptime != null ? fmt.duration(up.uptime) : fmt.DASH)
+					kv(_('Interface up for'), up.uptime != null ? fmt.duration(up.uptime) : fmt.DASH),
+					/* a full-tunnel VPN over this line: ordinary traffic goes through it */
+					up.tunnel ? kv(_('Tunnel'), up.tunnel.iface + (up.tunnel.proto ? ' · ' + up.tunnel.proto : '')) : '',
+					up.tunnel ? kv(_('In the tunnel'), tunR ? '↓ ' + fmt.bits(tunR.rx) + ' · ↑ ' + fmt.bits(tunR.tx) : fmt.DASH) : ''
 				]) ]),
 				this.section(_('Addresses'), [ E('dl', { 'class': 'vt-kvs' }, [
 					kv(_('IPv4'), up.ipv4.join('\n') || fmt.DASH, true),
 					kv(_('IPv6'), up.ipv6.join('\n') || fmt.DASH, true),
 					kv(_('Gateway'), up.gateway || fmt.DASH, true),
+					/* beside other lines, the metric says which one the kernel takes */
+					several ? kv(_('Route metric'), up.metric != null ? String(up.metric) : fmt.DASH, true) : '',
 					kv(_('DNS'), up.dns.join('\n') || fmt.DASH, true)
 				]) ]),
 				this.section(_('Counters since boot'), [ E('dl', { 'class': 'vt-kvs' }, [
-					kv(_('Received', 'vantage'), fmt.bytes(s.rx_bytes) + ' · ' + _('%d errors').format(+s.rx_errors || 0)),
-					kv(_('Sent', 'vantage'), fmt.bytes(s.tx_bytes) + ' · ' + _('%d errors').format(+s.tx_errors || 0)),
-					kv(_('Dropped', 'vantage'), _('%d in · %d out').format(+s.rx_dropped || 0, +s.tx_dropped || 0))
+					kv(_('Received', 'vantage'), fmt.bytes(s.rx_bytes) + ' · ' + errors(+s.rx_errors || 0)),
+					kv(_('Sent', 'vantage'), fmt.bytes(s.tx_bytes) + ' · ' + errors(+s.tx_errors || 0)),
+					kv(_('Dropped', 'vantage'), _('%s in · %s out').format(fmt.count(+s.rx_dropped || 0), fmt.count(+s.tx_dropped || 0)))
 				]) ])
 			]
 		};
@@ -3182,7 +3708,7 @@ return view.extend({
 					kv(_('Local time'), d.localtime != null ? new Date(d.localtime * 1000).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '') : fmt.DASH, true)
 				]) ]),
 				this.section(_('Load'), [ E('dl', { 'class': 'vt-kvs' }, [
-					kv(_('CPU', 'vantage'), cpu ? _('%s over %d cores').format(fmt.pct(cpu.pct), cpu.cores.length || 1) : fmt.DASH),
+					kv(_('CPU', 'vantage'), cpu ? fmt.N_(cpu.cores.length || 1, '%s over %d core', '%s over %d cores').format(fmt.pct(cpu.pct), cpu.cores.length || 1) : fmt.DASH),
 					kv(_('Load average', 'vantage'), d.load.map(fmt.load).join(' · ')),
 					kv(_('Memory in use'), d.memory ? _('%s of %s').format(fmt.bytes(d.memory.used), fmt.bytes(d.memory.total)) : fmt.DASH)
 				]) ])
@@ -3202,7 +3728,7 @@ return view.extend({
 			return;
 		}
 		if (ev.key === 'Escape' && this.editing && !this.drag) {
-			this.setEditing(false);
+			this.setEditing(false, this.viewFailed);
 			return;
 		}
 		/* 'f' focuses the client filter; '/' and Ctrl+K belong to the theme */

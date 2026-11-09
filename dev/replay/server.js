@@ -10,6 +10,7 @@
    usage: node server.js --mirror <dir> [--port 8025] [--theme-dir <htdocs/luci-static/name>]
                          [--theme <name>] [--templates <ucode/template dir>] [--rootfs <dir>]
                          [--app-dir <package dir>]... [--keep-uniwrt] [--[no-]synthetic] [--demo]
+                         [--wired | --big] [--multiwan] [--fullvpn]
                          [--lang <LuCI language, e.g. de or zh_Hans>] [--fixtures <dir>]...
 
    Pages are rendered like the device does: the dispatcher logic below
@@ -25,6 +26,13 @@
 
    --big serves the device as a larger access point (big.js): four radios,
    ten networks, 74 stations, five wired ports with hosts behind them.
+
+   --multiwan adds a second line to the internet (multiwan.js): a backup
+   WAN with a default route of a higher metric; with --wired or --big too.
+
+   --fullvpn gives the 'vpn' WireGuard interface a default route at the
+   uplink's metric, a full-tunnel VPN the kernel prefers (fullvpn.js);
+   with --wired, --big and --multiwan too.
 
    --fixtures <dir> (repeatable) adds hand-written data for pages the
    recording lacks (fixtures.js): rpcd plugin stand-ins, uci configs, a small
@@ -61,6 +69,8 @@ const i18n = require('../i18n/catalog');
 const policy = require('./policy');
 const wired = require('./wired');
 const big = require('./big');
+const multiwan = require('./multiwan');
+const fullvpn = require('./fullvpn');
 
 /* ------------------------------------------------------------ arguments */
 
@@ -68,7 +78,7 @@ function parseArgs(argv) {
 	const o = { port: 8025, synthetic: true };
 	for (let i = 0; i < argv.length; i++) {
 		const m = /^--(mirror|port|theme-dir|theme|templates|rootfs|app-dir|lang|fixtures)(?:=(.*))?$/.exec(argv[i]);
-		if (!m) { if (argv[i] === '--keep-uniwrt') o.keepUniwrt = true; else if (argv[i] === '--synthetic') o.synthetic = true; else if (argv[i] === '--no-synthetic') o.synthetic = false; else if (argv[i] === '--demo') o.demo = true; else if (argv[i] === '--wired') o.wired = true; else if (argv[i] === '--big') o.big = true; else if (argv[i] === '-h' || argv[i] === '--help') o.help = true; else o.bad = argv[i]; continue; }
+		if (!m) { if (argv[i] === '--keep-uniwrt') o.keepUniwrt = true; else if (argv[i] === '--synthetic') o.synthetic = true; else if (argv[i] === '--no-synthetic') o.synthetic = false; else if (argv[i] === '--demo') o.demo = true; else if (argv[i] === '--wired') o.wired = true; else if (argv[i] === '--big') o.big = true; else if (argv[i] === '--multiwan') o.multiwan = true; else if (argv[i] === '--fullvpn') o.fullvpn = true; else if (argv[i] === '-h' || argv[i] === '--help') o.help = true; else o.bad = argv[i]; continue; }
 		const v = (m[2] !== undefined) ? m[2] : argv[++i];
 		if (m[1] === 'app-dir') (o.appDirs = o.appDirs || []).push(v);
 		else if (m[1] === 'fixtures') (o.fixtures = o.fixtures || []).push(v);
@@ -77,7 +87,7 @@ function parseArgs(argv) {
 	return o;
 }
 
-const USAGE = 'usage: server.js --mirror <dir> [--port 8025] [--theme-dir <htdocs/luci-static/name>] [--theme <name>] [--templates <dir>] [--rootfs <dir>] [--app-dir <pkg>]... [--keep-uniwrt] [--no-synthetic] [--demo] [--wired | --big] [--lang <lang>] [--fixtures <dir>]...';
+const USAGE = 'usage: server.js --mirror <dir> [--port 8025] [--theme-dir <htdocs/luci-static/name>] [--theme <name>] [--templates <dir>] [--rootfs <dir>] [--app-dir <pkg>]... [--keep-uniwrt] [--no-synthetic] [--demo] [--wired | --big] [--multiwan] [--fullvpn] [--lang <lang>] [--fixtures <dir>]...';
 const opts = parseArgs(process.argv.slice(2));
 if (opts.help || opts.bad || !opts.mirror) {
 	console.error(opts.bad ? `unknown argument ${opts.bad}\n${USAGE}` : USAGE);
@@ -236,8 +246,9 @@ for (const [ name, file ] of fixtures.configs()) {
 	const values = parseUci(readText(file));
 	if (!store.uciSeed(name, values)) store.uciAddSections(name, values);
 }
-/* uci configs shipped by the app packages, unless the mirror has them */
-for (const d of appDirs) {
+/* uci configs shipped by the app packages and the theme's
+   (/etc/config/vantage_theme), unless the mirror has them */
+for (const d of appDirs.concat(themeDir ? [ path.resolve(themeDir, '../../..') ] : [])) {
 	const cdir = path.join(d, 'root/etc/config');
 	let files = [];
 	try { files = fs.readdirSync(cdir).filter(f => /^[A-Za-z0-9_-]+$/.test(f)); } catch (e) {}
@@ -327,6 +338,13 @@ const startTime = Math.floor(Date.now() / 1000);
 
 /* fake session: any login is accepted */
 const SID = crypto.randomBytes(16).toString('hex');
+/* luci.vantage routes (vantage-plugin.js) makes the kernel's table from
+   the interface dump the dashboard gets: after --wired, --big,
+   --multiwan and --fullvpn rewrote it */
+store.ifaceDump = () => {
+	const r = ubusReply({ jsonrpc: '2.0', id: 0, method: 'call', params: [ SID, 'network.interface', 'dump', {} ] }).result;
+	return Array.isArray(r) && r[0] === 0 && r[1] && Array.isArray(r[1].interface) ? r[1].interface : null;
+};
 const TOKEN = crypto.randomBytes(16).toString('hex');
 const SCRIPT = '/cgi-bin/luci';
 
@@ -434,10 +452,27 @@ function buildUrl(...p) {
 	return parts.length ? SCRIPT + '/' + parts.join('/') : SCRIPT + '/';
 }
 
+/* the logged-in session's groups, as rpcd grants them to root (read and
+   write '*'): every group of the packages' rpcd ACL files, for templates
+   that look at ctx.authacl (the theme's Appearance) */
+const ACL_GROUPS = {};
+for (const d of appDirs.concat(themeDir ? [ path.resolve(themeDir, '../../..') ] : [])) {
+	const adir = path.join(d, 'root/usr/share/rpcd/acl.d');
+	let files = [];
+	try { files = fs.readdirSync(adir).filter(f => /^[A-Za-z0-9_.-]+\.json$/.test(f)); } catch (e) {}
+	for (const f of files) {
+		let acl = null;
+		try { acl = JSON.parse(readText(path.join(adir, f))); } catch (e) {}
+		for (const g of Object.keys(acl && typeof acl === 'object' ? acl : {}))
+			if (/^[A-Za-z0-9_.-]+$/.test(g)) ACL_GROUPS[g] = [ 'read', 'write' ];
+	}
+}
+
 /* ucode environment the templates see */
 function templateEnv(req, resolved, loggedIn, form) {
 	const ctx = Object.assign({}, resolved.ctx, {
-		authsession: loggedIn ? SID : null, authtoken: loggedIn ? TOKEN : null, authuser: loggedIn ? 'root' : null
+		authsession: loggedIn ? SID : null, authtoken: loggedIn ? TOKEN : null, authuser: loggedIn ? 'root' : null,
+		authacl: loggedIn ? { 'access-group': Object.assign({}, ACL_GROUPS) } : null
 	});
 	const getenv = k => ({
 		SCRIPT_NAME: SCRIPT, PATH_INFO: '/' + resolved.ctx.request_path.join('/'), DOCUMENT_ROOT: '/www',
@@ -453,6 +488,11 @@ function templateEnv(req, resolved, loggedIn, form) {
 			/* no https listener here: keeps the login page from probing localhost:443 */
 			get: (c, s, o) => (c === 'uhttpd' && o === 'listen_https') ? null : store.uciGet(c, s, o),
 			get_all: (c, s) => store.uciGet(c, s),
+			/* the first section of a type: its option, or its name without one */
+			get_first: (c, t, o) => {
+				for (const s of Object.values(store.uciGet(c) || {})) if (s['.type'] === t) return o ? (s[o] ?? null) : s['.name'];
+				return null;
+			},
 			foreach: (c, t, fn) => { for (const s of Object.values(store.uciGet(c) || {})) if (!t || s['.type'] === t) if (fn(s) === false) break; }
 		},
 		ctx, version,
@@ -573,8 +613,17 @@ function ubusReply(msg) {
 		if (object === 'session' && method === 'access')
 			return Object.assign(reply, { result: [ 0, { access: !!(args && args.scope === 'ubus' && anonAllowed(args.object, args.function)) } ] });
 	}
+	/* one device by name, as netifd answers it: that device's entry in
+	   the (transformed) dump, which is what the recording has */
+	if (object === 'network.device' && method === 'status' && args && typeof args.name === 'string' && Object.keys(args).length === 1) {
+		const all = ubusReply({ jsonrpc: '2.0', id: reply.id, method: 'call', params: [ sid, object, method, {} ] }).result;
+		const devs = Array.isArray(all) && all[0] === 0 && all[1] && typeof all[1] === 'object' ? all[1] : null;
+		return Object.assign(reply, { result: devs && Object.prototype.hasOwnProperty.call(devs, args.name) ? [ 0, devs[args.name] ] : [ 4 ] });
+	}
 	const r = store.call(object, method, args || {});
-	return Object.assign(reply, opts.wired ? wired.transform(object, method, args, r) : opts.big ? big.transform(object, method, args, r) : r);
+	const dev = opts.wired ? wired.transform(object, method, args, r) : opts.big ? big.transform(object, method, args, r) : r;
+	const lines = opts.multiwan ? multiwan.transform(object, method, args, dev) : dev;
+	return Object.assign(reply, opts.fullvpn ? fullvpn.transform(object, method, args, lines) : lines);
 }
 
 async function handleUbus(req, res) {

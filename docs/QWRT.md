@@ -12,9 +12,9 @@ Download packages from this fork's
 [Releases](https://github.com/Demogorgon314/luci-theme-vantage/releases).
 The first release is `v1.0.12-qwrt.1`, with package version `1.0.12-r2`,
 based on upstream v1.0.12. The `qwrt` development branch now integrates
-upstream v1.0.14 as `1.0.14-r2`, including port traffic totals, swconfig
-switch details, mobile layout fixes and coexistence with LuCI's own
-dashboard. These development changes are not part of the
+upstream v1.0.17 as `1.0.17-r2`, including multi-WAN and VPN paths,
+faster CPU/traffic readings, shared Appearance settings and coexistence
+with LuCI's own dashboard. These development changes are not part of the
 `v1.0.12-qwrt.1` release tag.
 
 Runtime checks covered a QWRT QSDK 12.5 ARM64 image with QCA wireless
@@ -27,6 +27,21 @@ The QWRT changes provide QCA runtime interface mappings, Wi-Fi 7 mode
 normalization, storage meters and bridge-learned hosts. On legacy libnl
 images, bridge discovery avoids the native module that could crash rpcd
 and invalidate login sessions. This path does not report VLAN IDs.
+Kernel route lookups are also skipped on these images: the dashboard
+uses netifd's metrics instead. Equal-metric routes and routes added only
+by a VPN daemon cannot always be distinguished without the kernel answer.
+
+Since the v1.0.17 integration, Appearance and dashboard layouts can be
+saved across browsers in `/etc/config/vantage_theme`. The theme's own
+`luci-theme-vantage` ACL group may set, commit and revert that config only;
+the dashboard's read group remains read-only, with `luci.vantage routes`
+added for optional kernel lookups. Force-refresh after an upgrade; if an
+existing login cannot save Appearance, log in again to acquire its group.
+
+Check for updates reads this fork's published feed, only when clicked.
+It compares the full package version (including `-r2`, `-r3`, etc.) and
+links to this fork's releases. Development builds ahead of the published
+feed remain installed; checking never installs or downgrades a package.
 
 ## Install from release files (opkg)
 
@@ -74,15 +89,18 @@ Use this fork's feed instead of the upstream Vantage feed for these
 package names; an upstream upgrade can replace the QWRT adaptations.
 Keep your firmware's normal dependency feeds.
 
-For opkg, verify the public key before adding it:
+For opkg, verify the public key's SHA-256 before adding it. Its installed
+key number is `36f38cc55cf41341`; the number alone does not verify its
+contents. The commands stop on a failed download or hash check:
 
 ```sh
-wget -O /tmp/qwrt-24.10.usign.pub https://Demogorgon314.github.io/luci-theme-vantage/qwrt-24.10.usign.pub
-usign -F -p /tmp/qwrt-24.10.usign.pub
-# must print 36f38cc55cf41341
-opkg-key add /tmp/qwrt-24.10.usign.pub
-echo 'src/gz vantage_qwrt https://Demogorgon314.github.io/luci-theme-vantage/24.10' >> /etc/opkg/customfeeds.conf
-opkg update
+key=$(mktemp) &&
+wget -O "$key" https://Demogorgon314.github.io/luci-theme-vantage/qwrt-24.10.usign.pub &&
+echo "4822c152ce7acf3d0b4ef81e4c4c005d6e6b3b292aa5c0d8646337fb831cafd8  $key" | sha256sum -c - &&
+opkg-key add "$key" &&
+rm -f "$key" &&
+{ grep -qxF 'src/gz vantage_qwrt https://Demogorgon314.github.io/luci-theme-vantage/24.10' /etc/opkg/customfeeds.conf || echo 'src/gz vantage_qwrt https://Demogorgon314.github.io/luci-theme-vantage/24.10' >> /etc/opkg/customfeeds.conf; } &&
+opkg update &&
 opkg install luci-theme-vantage luci-app-vantage luci-i18n-vantage-theme-zh-cn luci-i18n-vantage-zh-cn
 ```
 
@@ -119,6 +137,7 @@ The upstream keys retained under `keys/` do not sign this fork's releases.
   Offline unit tests cannot prove native library compatibility.
 
 For rollback, reinstall the four packages from the previous QWRT release,
-reload rpcd and log in again. Preserve `/etc/config/vantage` if you want
-to retain device aliases. All general uninstall and theme-switching steps
+reload rpcd and log in again. Preserve `/etc/config/vantage` for device
+aliases and `/etc/config/vantage_theme` for Appearance and layouts.
+All general uninstall and theme-switching steps
 remain in [INSTALL.md](INSTALL.md).

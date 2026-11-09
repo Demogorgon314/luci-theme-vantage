@@ -1,10 +1,21 @@
 # Changelog
 
-## Unreleased - upstream 1.0.14 integration
+## Unreleased - upstream 1.0.17 integration
 
-Development packages use `1.0.14-r2`. The published `v1.0.12-qwrt.1` tag
+Development packages use `1.0.17-r2`. The published `v1.0.12-qwrt.1` tag
 continues to identify the original tested release.
 
+- Merge upstream v1.0.15 through v1.0.17 (`a370921`): updated dashboard
+  cards, multi-WAN/VPN paths, faster CPU/traffic sampling and saved
+  Appearance. The app adds a read-only `luci.vantage routes` grant; the
+  theme's separate ACL may change `/etc/config/vantage_theme` only.
+- Skip kernel route lookups when the legacy-library guard disables rtnl,
+  using netifd's metrics without loading conflicting native libraries.
+  Keep route and storage replies separate throughout dashboard refreshes.
+- Check this fork's signed feed and release page, comparing full package
+  versions including QWRT revisions. Show `1.0.17-r2` in both packages.
+- Verify the QWRT opkg key by its file hash and stop feed setup if a check
+  fails. Keep the fork's signing keys and publication pipeline.
 - Merge upstream v1.0.14 (`cddbfb2`): mobile layout and apply-spinner fixes,
   cached dashboard styles, weak-signal client filtering and coexistence
   with `luci-mod-dashboard`. The additional Status dashboard entry uses
@@ -46,6 +57,185 @@ Each release ships both packages, `luci-theme-vantage` and
 `luci-app-vantage`, at the same version; the packages are listed at
 <https://github.com/anothaDev/luci-theme-vantage/releases> and in the
 [signed repositories](https://anothadev.github.io/luci-theme-vantage/).
+
+## 1.0.17 - 2026-11-08
+
+- **Install commands stop when a check fails.** Each pasted block now
+  chains its steps, so a key or file that doesn't match its published
+  SHA-256 stops it before anything is trusted or installed. On 24.10 the
+  key is checked by its file's SHA-256: the `usign -F` fingerprint is
+  stored in the key itself and proved nothing. Files are fetched into a
+  private `/tmp/vantage` folder, and Uninstall now also removes the
+  signing key and the feed line, on both package managers.
+- **Theme: the pulse is back** (#100,
+  [@smallprogram](https://github.com/smallprogram)). The dashboard's
+  status circle pulses slowly while all is fine and faster when something
+  needs attention, and the top bar's refresh dot does the same: soft green
+  while refreshing, amber and faster on a warning or while reconnecting,
+  red on an error. The login page has no dot.
+- **Theme: the login page shows the router's hostname** instead of
+  "Authorization Required" (#100).
+- **Theme: a name next to the logo** (#100). Appearance → Next to the
+  logo shows the hostname or the model beside the logo; the default stays
+  the logo only.
+- **Installed version and a Check for updates button** (#102,
+  [@bakaranadnan-a11y](https://github.com/bakaranadnan-a11y)). The
+  dashboard's System tile and Appearance show the version. Check for
+  updates reads the project's package list from your browser, only when
+  you click it, without cookies or a referrer; nothing installs by itself.
+- **Theme: the memory meter on Kwrt** (#103,
+  [@keriesli](https://github.com/keriesli)). Status → Overview showed
+  100% available and 0 B in use with luci-mod-status builds that have no
+  "Total Available" row; those are read too now, swap included.
+- **Dashboard: on routers without Wi-Fi the network path shows the Wired
+  branch** (#98, [@VIKINGYFY](https://github.com/VIKINGYFY)), with its
+  hosts, as on Wi-Fi devices.
+- **Theme: text fields in tables keep their width** (#106,
+  [@elonnzhang](https://github.com/elonnzhang)). A column with a short
+  header, such as Name and Path in Network Shares, shrank to a sliver
+  and hid its value.
+- **Dashboard: pausing stops the motion.** Paused from the top bar's
+  refresh pill, the status ring, the flow dots and the backdrop stand
+  still; the CPU reading starts over on resume.
+- **Dashboard: history stays with one login.** The charts' history kept
+  in the browser tab is dropped at logout and ignored by another login in
+  the same tab.
+
+## 1.0.16 - 2026-11-06
+
+- **Theme: Appearance is saved on the router** (#89,
+  [@smallprogram](https://github.com/smallprogram)). The colour mode
+  (auto, light or dark), the login page's background and the dashboard's
+  network path background were kept in each browser, so another computer
+  showed the defaults. They are now saved in `/etc/config/vantage_theme`
+  and the same in every browser, the login page included, from the first
+  paint. With the theme installed, the dashboard's layout and chart style
+  are saved there too, when you press Done under Customize; each screen
+  size keeps its own layout. A browser keeps its earlier picks until
+  someone changes the setting. Saving needs the theme's new rpcd group,
+  `luci-theme-vantage` (root has it), which may write that one config
+  only; without it a
+  change stays in that browser, as before, and Appearance says so. Logins
+  already open get the group too, when the install reloads rpcd.
+- **Dashboard: right download rate on PPPoE with flow offloading** (#92,
+  [@Omoinemie](https://github.com/Omoinemie)). Offloaded downloads skip
+  `pppoe-wan`'s counters, so the uplink read a few kbit/s during a speed
+  test. A PPPoE line now counts on the port under it.
+- **Dashboard: the network path at medium widths.** Between about 860 and
+  1050 pixels the rates slid under the device card and a long tag ran out
+  of its card.
+- **Esc in the Ctrl K search stays there.** It also closed a drawer behind
+  the search.
+- **Dashboard: every line to the internet in the network path** (#88,
+  [@Bryce199805](https://github.com/Bryce199805)). With two or more WANs
+  (failover by metric, or mwan3) the path showed one, and on a router
+  without Wi-Fi the others appeared among the local networks. Every up
+  interface with a default route of its own now sits on the internet
+  side (the main one and up to four more), each with its own wire into the
+  device and its live rates, and opens its own details; the one whose
+  default route has the lowest metric is marked "default route", and on a
+  tie the one the kernel takes (with mwan3, its own rules decide where
+  traffic goes). IPv6 on the same device, on the port under a PPPoE
+  session (`wan6`), or through 6rd, 6in4 or 6to4 stays part of its line. The throughput chart has a row
+  per line, and each line keeps its own history across a failover. A WAN
+  that is down shows nowhere until it comes up again. With one line the
+  path is as before.
+- **A full-tunnel VPN is drawn as a tunnel through the line.** When
+  ordinary traffic goes through a VPN (WireGuard, OpenVPN, GRE, ...), the
+  path shows the line it leaves by with the tunnel on its wire: a lock and
+  the VPN's name under the line's rates, "default route via vpn" beside
+  other lines, and the tunnel and its own rates in the line's details. The
+  VPN no longer stands in for the line, and it shows on routers with
+  Wi-Fi too, where the networks are not listed. Which route wins comes
+  from the kernel (a new read-only `luci.vantage routes` asks it which
+  route it takes to the internet, as `ip route get` does, one lookup for
+  IPv4 and one for IPv6): with a VPN and a WAN of the same metric, as
+  WireGuard and DHCP leave them, the kernel keeps the route added last,
+  which netifd's list cannot tell, and OpenVPN adds its own. Without that
+  answer, only a VPN with a lower metric than the line's counts. An IPv4
+  VPN over an IPv6-only line rides it too. A VPN that holds the only
+  default route is still the uplink; a backup VPN, one in its own routing
+  table, and OpenVPN's `redirect-gateway def1` stay among the networks.
+  With several lines the tunnel is drawn on the main one.
+- **The throughput chart stops flipping to "collecting".** With five
+  minutes of history, its subtitle kept switching between "last 5 min" and
+  "collecting · 4 min of data", because the oldest sample kept is usually a
+  few seconds short of five minutes.
+
+## 1.0.15 - 2026-11-04
+
+- **The dashboard and LuCI's pages look like one product.** The dashboard
+  takes the theme's buttons, focus ring, tabs (the Wi-Fi/Wired switch),
+  tables, menus and phone sheet, the same status colours on every
+  Firewall tab and one blue meter for memory and storage, with one scale
+  of weights and corners in both packages.
+- **Vantage's dashboard goes with Vantage's theme** (#83,
+  [@smallprogram](https://github.com/smallprogram)). With both packages
+  installed and another theme selected, such as Argon, the dashboard
+  still opened after login and looked broken in that theme. Dashboard
+  and the page after login now open LuCI's own: Status → Dashboard when
+  `luci-mod-dashboard` is installed, otherwise Status → Overview.
+  Installed without the theme, the dashboard still works under any
+  theme.
+- **Health cards with their own icons and a picture each.** The six
+  cards above the network path all carried the same check mark. Each now
+  has its own icon in the corner (port, CPU, memory, Wi-Fi, signal,
+  storage), coloured only when it needs attention, and a picture along
+  its bottom edge: the last minutes of download and CPU, how full memory
+  and storage are, the Wi-Fi clients by band (or each radio's airtime
+  where the driver reports it), and how the clients' signals spread.
+  Signal shows the weakest client instead of "All good".
+- **Uplink traffic and CPU update every 2 seconds** instead of every 5,
+  on the cards, the network path and the throughput chart. They are two
+  small reads of their own (CPU times and the uplink's counters); the
+  rest of the dashboard still refreshes every 5 seconds, and nothing
+  polls while the tab is hidden.
+- **The throughput chart's minute labels stay put** (#71,
+  [@HyperdrivzZ](https://github.com/HyperdrivzZ)). While the five minutes
+  of history filled, the time axis stretched with it and "−2 min" slid
+  into "3 min ago" on a phone. The axis is now always five minutes, and
+  the lines start part way across until the history is full.
+- **The network path's background is under Appearance**, next to the
+  login page's, instead of in the dashboard's Customize bar. A dashboard
+  installed without the theme keeps it under Customize.
+- **Less repetition on the dashboard.** The four numbers under the network
+  path, which repeated the cards, are gone, and so are the hints and the
+  "which is fine" notes. A device without a name is "Private device" next
+  to its MAC address and "Private device 53:0F" where it has one line.
+  Rates in rows carry their unit, link speeds read "2.5 Gbit/s" on the
+  cards and in the details, and only open or weak networks show a lock. Noise and
+  airtime rows appear only where the driver reports them. Nothing pulses
+  while everything is fine, and under the Vantage theme the dashboard's
+  own Live pill shows only when updates pause or fail.
+- **The network path is open on phones.** It used to start folded, with
+  the four numbers that are now gone as its summary. I'd like feedback on
+  this one: tell me in an
+  [issue](https://github.com/anothaDev/luci-theme-vantage/issues) if
+  you'd rather it started folded. A fold you choose is still remembered.
+- **Firewall:** reject and drop are no longer painted red, on Overview or
+  in General Settings' policies; only an internet zone that accepts input
+  is, in red on both. Overview's admin warning names the service and port
+  it lets in (SSH, Telnet, HTTP, HTTPS), and addresses wrap instead of
+  losing their port on a phone.
+- **Less repetition in the shell.** A breadcrumb title shows once
+  ("System", not "System › System"), the palette names each category
+  once and "wire" finds the Wireless pages rather than eight firewall
+  pages, the rail's flyouts drop their counts and Ctrl K footer, the host
+  chip leaves out a name the other contains, and the word "Vantage" is
+  gone from the rail and the login page. Storage bars label their total.
+- **The shell's dots stay still.** The auto-refresh pill has a still
+  dot (a pause or play sign on narrow screens), and Status → Overview
+  marks only boxes that are down, not every one that is up.
+- **File Manager in dark mode** (#84, [@QiuSimons](https://github.com/QiuSimons)).
+  `luci-app-filemanager` brings a light palette of its own, so its status
+  bar was a white band with unreadable text and a hovered row washed out;
+  they take the theme's colours now.
+- **Fixes:** theme buttons render at their intended weight, pages before
+  login are titled "LuCI" instead of "LuCI · LuCI", a page that does not
+  exist says "Not found" instead of "Administration", the memory bar
+  clears when memory stops being reported, switching Clients between
+  Wi-Fi and Wired no longer leaves a tall empty tile for 30 s, and the
+  address follows when you open a client from a radio's details.
 
 ## 1.0.14 - 2026-11-03
 
